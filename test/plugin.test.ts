@@ -6,7 +6,7 @@ import { CursorPlugin, modelInfoToConfig, thinkingSuffixBaseNames } from "../src
 import { CURSOR_VARIANT_PARAMETERS_KEY, readCache, writeCache, type ModelInfo } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { resetAgentUrlCache } from "../src/agent-url.js"
-import { CURSOR_COMPACTION_OPTION } from "../src/shared.js"
+import { CURSOR_COMPACTION_OPTION, CURSOR_HOST_AGENT_OPTION } from "../src/shared.js"
 import {
   CURSOR_TIMEOUT_BACKGROUND,
   buildBackgroundShellCommand,
@@ -279,6 +279,7 @@ describe("CursorPlugin compaction marker", () => {
       model: { providerID: "cursor" },
     } as never, compaction as never)
     expect(compaction.options[CURSOR_COMPACTION_OPTION]).toBe(true)
+    expect(compaction.options[CURSOR_HOST_AGENT_OPTION]).toBe("compaction")
 
     const normal = { options: {} as Record<string, unknown> }
     await plugin["chat.params"]?.({
@@ -287,6 +288,7 @@ describe("CursorPlugin compaction marker", () => {
       model: { providerID: "cursor" },
     } as never, normal as never)
     expect(normal.options[CURSOR_COMPACTION_OPTION]).toBeUndefined()
+    expect(normal.options[CURSOR_HOST_AGENT_OPTION]).toBe("build")
   })
 })
 

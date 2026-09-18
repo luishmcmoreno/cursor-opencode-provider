@@ -1,16 +1,14 @@
 /**
- * Local structural types for the OpenCode 2.0 beta plugin API.
+ * Runtime duck-type boundary for the OpenCode 2.0 plugin — not host conformance.
  *
- * Why not import from `@opencode-ai/plugin`?
- *   • The 2.0 types live on the `@next` dist-tag (`0.0.0-next-*`), which cannot
- *     coexist with this package's existing `@opencode-ai/plugin@^1.17.13`
- *     dependency under the same module specifier.
- *   • 2.0 is beta and its schema churns; a hand-maintained subset of only what
- *     we touch is more stable than pinning a moving target.
+ * Only the methods and fields this plugin calls or publishes. Extra host
+ * fields are ignored at runtime. Do not import `@opencode/plugin`: it is not a
+ * standalone types surface we can pin next to `@opencode-ai/plugin`, and a host
+ * dependency would force a plugin bump on every OpenCode release.
  *
- * These mirror `@opencode-ai/plugin@next` `dist/promise/*.d.ts` as of
- * `0.0.0-next-17155`. `test/opencode2-conformance.types.ts` asserts our
- * default export still satisfies the real 2.0 `Plugin` interface.
+ * Compile-time checks that our *calls and payloads* still fit the fuller host
+ * editor live in `test/opencode2-conformance.types.ts` against
+ * `test/opencode2-host-contract.ts`.
  *
  * Effect `Schema` brands (Provider.ID, Model.ID, …) are modelled as plain
  * `string`; brands are compile-time only and erase at runtime.
@@ -29,25 +27,20 @@ export type Hooks<Spec> = <Name extends keyof Spec>(
 
 export type Transform<Input> = (callback: (input: Input) => void) => Promise<Registration>
 
-// ── Schema shapes (mutable drafts) ──
+// ── Schema shapes this plugin publishes (runtime duck-type, not the host SDK) ──
 
 export type ProviderInfo = {
   id: string
   name: string
   /** `"aisdk:<pkg>"` selects the AI SDK path; a bare specifier selects native. */
   package: string
+  activation: "auto" | "enabled" | "disabled"
   integrationID?: string
-  disabled?: boolean
-  settings?: Record<string, any>
-  headers?: Record<string, string>
-  body?: Record<string, any>
 }
 
 export type ModelVariantInfo = {
   id: string
   settings?: Record<string, any>
-  headers?: Record<string, string>
-  body?: Record<string, any>
 }
 
 export type ModelInfo2 = {
@@ -56,9 +49,6 @@ export type ModelInfo2 = {
   modelID: string
   providerID: string
   name: string
-  family?: string
-  // Arrays are `readonly` to match the published `Model.Info`. Catalog code
-  // assigns whole arrays rather than mutating in place, so this costs nothing.
   capabilities: { tools: boolean; input: readonly string[]; output: readonly string[] }
   variants: readonly ModelVariantInfo[]
   time: { released: number }
@@ -69,13 +59,10 @@ export type ModelInfo2 = {
     output: number
     cache: { read: number; write: number }
   }[]
-  status: "alpha" | "beta" | "deprecated" | "active"
+  status: "active"
   enabled: boolean
   limit: { context: number; input?: number; output: number }
   settings?: Record<string, any>
-  headers?: Record<string, string>
-  body?: Record<string, any>
-  package?: string
 }
 
 // ── Credentials ──
@@ -101,36 +88,22 @@ export type ConnectionInfo =
   | { type: "credential"; id: string; label: string }
   | { type: "env"; name: string }
 
-// ── Catalog ──
+// ── Provider ──
 
 /**
- * Read accessors we never call are intentionally loose (`any`). Modelling the
- * host's Effect-schema records exactly would make the conformance guard churn on
- * unrelated upstream edits without protecting anything we depend on. The
- * `update` signatures — the ones we actually build the catalog with — stay precise.
+ * Inventory writer this plugin uses (`editor.add` only).
+ * The host editor is a superset; unused methods are not part of this boundary.
  */
-export type CatalogDraft = {
-  readonly provider: {
-    list(): readonly any[]
-    get(providerID: string): any
-    /** Upsert: creates the provider when absent. */
-    update(providerID: string, update: (provider: ProviderInfo) => void): void
-    remove(providerID: string): void
-  }
-  readonly model: {
-    get(providerID: string, modelID: string): any
-    /** Upsert: creates provider and/or model when absent. */
-    update(providerID: string, modelID: string, update: (model: ModelInfo2) => void): void
-    remove(providerID: string, modelID: string): void
-    readonly default: {
-      get(): { providerID: string; modelID: string } | undefined
-      set(providerID: string, modelID: string): void
-    }
-  }
+export type ProviderEditor = {
+  add(input: {
+    info: ProviderInfo
+    models: readonly ModelInfo2[]
+    sourceConnection?: ConnectionInfo
+  }): void
 }
 
-export type CatalogDomain = {
-  readonly transform: Transform<CatalogDraft>
+export type ProviderDomain = {
+  readonly transform: Transform<ProviderEditor>
   readonly reload: () => Promise<void>
 }
 
@@ -147,6 +120,7 @@ export type IntegrationOAuthMethod = {
   id: string
   type: "oauth"
   label: string
+  form?: unknown
   prompts?: IntegrationTextPrompt[]
 }
 
@@ -169,7 +143,7 @@ export type IntegrationOAuthAuthorization = {
 export type IntegrationOAuthMethodRegistration = {
   readonly integrationID: string
   readonly method: IntegrationOAuthMethod
-  readonly authorize: (inputs: Record<string, string>) => Promise<IntegrationOAuthAuthorization>
+  readonly authorize: (answer: any) => Promise<IntegrationOAuthAuthorization>
   readonly refresh?: (credential: CredentialOAuth) => Promise<CredentialOAuth>
   readonly label?: (credential: CredentialOAuth) => string | undefined
 }
@@ -182,14 +156,9 @@ export type IntegrationMethodRegistration =
 export type IntegrationRef = { id: string; name: string }
 
 export type IntegrationDraft = {
-  list(): readonly any[]
-  get(id: string): any
   update(id: string, update: (integration: IntegrationRef) => void): void
-  remove(id: string): void
   readonly method: {
-    list(integrationID: string): readonly any[]
     update(input: IntegrationMethodRegistration): void
-    remove(integrationID: string, method: any): void
   }
 }
 
@@ -204,15 +173,22 @@ export type IntegrationDomain = {
 
 // ── AI SDK ──
 
+/** Fields this plugin reads from the host model object. */
+export type HostModelRef = {
+  readonly id: string
+  readonly modelID: string
+  readonly providerID: string
+}
+
 export type AISDKHooks = {
   sdk: {
-    readonly model: ModelInfo2
+    readonly model: HostModelRef
     readonly package: string
     readonly options: Record<string, any>
     sdk?: any
   }
   language: {
-    readonly model: ModelInfo2
+    readonly model: HostModelRef
     readonly sdk: any
     readonly options: Record<string, any>
     language?: unknown
@@ -223,15 +199,37 @@ export type AISDKDomain = { readonly hook: Hooks<AISDKHooks> }
 
 // ── Tools ──
 
+export type ToolOptions = {
+  readonly namespace?: string
+  readonly permission?: string
+  readonly codemode?: boolean
+  readonly pinned?: boolean
+}
+
+/** Public OpenCode 2 tool context. It deliberately has no permission `ask`. */
+export type ToolExecutionContext = {
+  readonly sessionID: string
+  readonly agent: string
+  readonly messageID: string
+  readonly id: string
+  readonly progress: (update: Record<string, unknown>) => Promise<void>
+}
+
 export type ToolDefinition = {
   readonly name: string
   readonly description: string
   readonly input: unknown
   readonly output?: unknown
-  readonly execute: (input: any, context: any) => Promise<any>
+  readonly options?: ToolOptions
+  readonly execute: (input: any, context: ToolExecutionContext) => Promise<any>
 }
 
-export type ToolDraft = { add(tool: ToolDefinition): void }
+export type ToolDraft = {
+  add(tool: ToolDefinition): void
+  /** Host ToolEditor.get — used to skip registering tools the host already owns. */
+  get?(id: string): (ToolDefinition & { readonly id?: string }) | undefined
+  list?(): readonly (ToolDefinition & { readonly id: string })[]
+}
 
 export type ToolHookBaseFields = {
   readonly tool: string
@@ -256,6 +254,7 @@ export type ToolHooks = {
 
 export type ToolDomain = {
   readonly transform: Transform<ToolDraft>
+  readonly reload: () => Promise<void>
   readonly hook: Hooks<ToolHooks>
 }
 
@@ -268,11 +267,36 @@ export type SessionContext = {
   system: Array<any>
   messages: Array<any>
   tools: Record<string, { description: string; input: unknown }>
+  /** Mutable generation / provider options. OpenCode 2.0 SessionRequest.options. */
+  options?: Record<string, unknown>
 }
 
-export type SessionHooks = { readonly context: SessionContext }
+export type SessionCompactionResult = {
+  summary: string
+  providerState?: unknown
+  metadata?: Record<string, unknown>
+  tokens?: unknown
+}
 
-/** Only the `location.directory` field we actually read; the rest of the real `SessionInfo` is loose. */
+export type SessionCompaction = SessionContext & { result?: SessionCompactionResult }
+export type SessionGenerate = SessionContext
+export type SessionTitle = {
+  readonly sessionID: string
+  readonly model: { providerID: string; id: string; variant?: string }
+  system: Array<any>
+  messages: Array<any>
+  options?: Record<string, unknown>
+  result?: string
+}
+
+export type SessionHooks = {
+  readonly context: SessionContext
+  readonly compaction: SessionCompaction
+  readonly generate: SessionGenerate
+  readonly title: SessionTitle
+}
+
+/** Only the `location.directory` field we actually read. */
 export type SessionInfo = {
   readonly id: string
   readonly location: { readonly directory: string }
@@ -281,30 +305,16 @@ export type SessionInfo = {
 export type SessionDomain = {
   readonly hook: Hooks<SessionHooks>
   readonly get: (input: { sessionID: string }) => Promise<SessionInfo>
-}
-
-// ── Web search ──
-
-export type WebSearchDefinition = {
-  readonly id: string
-  readonly name: string
-  readonly execute: (
-    input: any,
-    context: { readonly signal: AbortSignal },
-  ) => Promise<readonly any[]>
-}
-
-export type WebSearchDraft = {
-  add(definition: WebSearchDefinition): void
-  readonly default: {
-    get(): string | undefined
-    set(providerID: string): void
-  }
-}
-
-export type WebSearchDomain = {
-  readonly transform: Transform<WebSearchDraft>
-  readonly reload: () => Promise<void>
+  readonly switchAgent?: (input: { sessionID: string; agent: string }) => Promise<void>
+  readonly synthetic?: (input: {
+    sessionID: string
+    text: string
+    description?: string
+    metadata?: Record<string, unknown>
+    delivery?: "steer" | "queue"
+    resume?: boolean
+  }) => Promise<unknown>
+  readonly prompt?: (input: { sessionID: string; text: string }) => Promise<unknown>
 }
 
 // ── Events ──
@@ -315,37 +325,55 @@ export type EventDomain = {
 
 // ── Plugin ──
 
-export type App = {
-  readonly name: string
-  readonly version: string
-  readonly channel: string
+export type ShellCreateBefore = {
+  command: string
+  cwd: string
+  timeout: number
+  shell: string
+  env: Record<string, string | undefined>
+}
+
+export type ShellDomain = {
+  readonly hook: Hooks<{ readonly "create.before": ShellCreateBefore }>
+}
+
+export type WebSearchResult = {
+  url: string
+  title?: string
+  content?: string
+  time: { published?: number }
+}
+
+export type WebSearchEditor = {
+  add(definition: {
+    readonly id: string
+    readonly name: string
+    readonly execute: (
+      input: { query: string },
+      context: { readonly signal: AbortSignal },
+    ) => Promise<readonly WebSearchResult[]>
+  }): void
+}
+
+export type WebSearchDomain = {
+  readonly transform: Transform<WebSearchEditor>
+  readonly reload: () => Promise<void>
+}
+
+export type PluginLocation = {
+  readonly directory: string
 }
 
 export type PluginContext = {
-  readonly app: App
-  readonly options: Readonly<Record<string, any>>
   readonly aisdk: AISDKDomain
-  /**
-   * Present on OpenCode 2.0 beta builds that expose the unified catalog domain.
-   * Stable 2.0.5 omits this — use config `providers.cursor` sync instead.
-   */
-  readonly catalog?: CatalogDomain
   readonly event: EventDomain
   readonly integration: IntegrationDomain
+  readonly provider: ProviderDomain
   readonly session: SessionDomain
   readonly tool: ToolDomain
+  readonly location?: PluginLocation
+  readonly shell?: ShellDomain
   readonly websearch?: WebSearchDomain
-  /** Split provider domain on stable 2.0.5 (transforms do not flush to picker). */
-  readonly provider?: {
-    readonly list: () => Promise<any> | any
-    readonly reload?: () => Promise<void>
-    readonly transform?: Transform<any>
-  }
-  readonly model?: {
-    readonly list: () => Promise<any> | any
-    readonly reload?: () => Promise<void>
-    readonly transform?: Transform<any>
-  }
 }
 
 export type Cleanup = () => Promise<void> | void

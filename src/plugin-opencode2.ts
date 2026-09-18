@@ -1,66 +1,97 @@
-import { CURSOR_PROVIDER_ID } from "./shared.js"
+import {
+  CURSOR_PROVIDER_ID,
+  CURSOR_COMPACTION_OPTION,
+  CURSOR_HOST_AGENT_OPTION,
+} from "./shared.js"
 import { createSdk, cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled, isCursorPackage } from "./plugin-core.js"
 import { opencodeGlobalCacheDir } from "./context/paths.js"
 import { discoverModels, isCacheFresh, readCache, type ModelInfo } from "./models.js"
 import { resolveAgentUrl } from "./agent-url.js"
 import { sessionActivity } from "./activity.js"
-import { fetchOpenCodeWebSearchText, type OpenCodeWebSearchArgs } from "./web-tools.js"
 import {
-  executeCursorImageSave,
-  type ImageSaveResult,
-  type ImageSaveToolContext,
-} from "./image-save.js"
-import { CURSOR_IMAGE_SAVE_TOOL } from "./protocol/generate-image.js"
+  fetchOpenCodeWebSearchText,
+  parseExaWebSearchResults,
+} from "./web-tools.js"
 import {
   captureCursorShellResult,
-  cursorShellOriginalCommand,
+  cursorShellEnvForCommand,
   prepareCursorShellArgs,
   releaseCursorShellEnv,
   sanitizeRegisteredCursorShellOutput,
 } from "./shell-timeout.js"
-import { applyCursorModels, applyCursorProvider } from "./opencode2/catalog.js"
-import {
-  hasCatalogDomain,
-  stableModelsPublished,
-  syncCursorProvidersConfigAndReload,
-} from "./opencode2/config-catalog.js"
+import { applyCursorProviderInventory, CURSOR_INTEGRATION_ID } from "./opencode2/catalog.js"
 import { applyCursorIntegration, resolveCursorAccessToken } from "./opencode2/integration.js"
+import { registerTodoTools } from "./opencode2/todo-tools.js"
+import { clearSessionTodos } from "./todo-store.js"
 import { markCompactionSession } from "./compaction-marker.js"
 import { markSessionDirectory } from "./session-directory.js"
-import { setPlanExecutionKickoff } from "./plan-execution-kickoff.js"
+import {
+  cancelPlanExecutionKickoff,
+  createPlanExecutionKickoffText,
+  setPlanExecutionKickoff,
+} from "./plan-execution-kickoff.js"
+import {
+  cancelHostAgentModeSwitch,
+  setHostAgentModeSwitch,
+} from "./host-agent-mode.js"
+import {
+  clearActiveCursorMode,
+  getActiveCursorMode,
+  normalizeSwitchModeId,
+  setActiveCursorMode,
+} from "./protocol/switch-mode.js"
+import { CursorPlugin } from "./plugin.js"
 import type { CreateCursorOptions } from "./index.js"
-import type { Cleanup, PluginContext, Plugin2 } from "./opencode2/types.js"
+import type {
+  Cleanup,
+  ConnectionInfo,
+  PluginContext,
+  Plugin2,
+  SessionContext,
+} from "./opencode2/types.js"
 
 /**
- * OpenCode 2.0 plugin (beta catalog API + stable 2.0.5 compat).
+ * OpenCode 2.0 plugin.
  *
  * Separate from `plugin-v2.ts` on purpose: the OpenCode 1.18 `/v2/promise` API
  * and the 2.0 API are source-incompatible (hook signatures, OAuth value type,
  * provider schema), so they cannot share an entrypoint. Shared behavior lives in
  * `plugin-core.ts`, `model-config.ts`, and `opencode2/*`.
  *
- * Host matrix:
- * - OC2 **beta** with `ctx.catalog` → register provider/models via catalog.transform
- * - OC2 **stable 2.0.5** (no catalog) → auth + aisdk hooks still run; models are
- *   synced into user config `providers.cursor` (see `config-catalog.ts`)
- * - OC1 → use classic `./plugin` or `./plugin/v2`, not this entry
+ * Models register in memory via `ctx.provider.transform` + `editor.add` +
+ * `reload()`. Nothing is written into `opencode.json`.
+ *
+ * Dual export: `{ id, setup, server: CursorPlugin }`. OpenCode 2.0 Host.resolve
+ * loads `./server` then `setup()`. OpenCode 1.18 also prefers `exports["./server"]`
+ * and then calls `server()` so classic 1.x hooks still run.
  *
  * Load with:  { "plugin": ["cursor-opencode-provider/plugin/opencode2"] }
  * or a local package directory under `$OPENCODE_CONFIG_DIR/plugins/` that
- * re-exports `dist/plugin-opencode2.js` (stable 2.0.x requires a directory, not a .js path).
+ * re-exports `dist/plugin-opencode2.js` (OpenCode 2.0 requires a directory,
+ * not a .js path).
  */
 
-async function loadModels(cacheDir: string, accessToken: string | undefined): Promise<ModelInfo[]> {
+async function loadModels(
+  cacheDir: string,
+  accessToken: string | undefined,
+  forceRefresh = false,
+): Promise<ModelInfo[]> {
   const cached = await readCache(cacheDir)
-  if (cached?.models.length && isCacheFresh(cached)) return cached.models
+  if (!forceRefresh && cached?.models.length && isCacheFresh(cached)) return cached.models
 
   if (accessToken) {
     try {
-      return await discoverModels(accessToken, cacheDir, { baseURL: cursorApiBaseURL() })
+      return await discoverModels(accessToken, cacheDir, {
+        baseURL: cursorApiBaseURL(),
+        forceRefresh,
+      })
     } catch {
-      // Fall through to stale-on-failure below.
+      // A forced refresh follows a credential switch. Do not bind a cache
+      // produced by the prior account to the new connection on failure.
+      if (forceRefresh) return []
     }
   }
+  if (forceRefresh) return []
   // Preserve offline / stale-cache behavior rather than emptying the picker.
   return cached?.models ?? []
 }
@@ -71,17 +102,74 @@ function toolExecutionID(event: { readonly id?: string; readonly callID?: string
   return id
 }
 
-const plugin: Plugin2 = {
+function isShellTool(name: string | undefined): boolean {
+  return name === "bash" || name === "shell"
+}
+
+function eventPayload(event: any): any {
+  if (event?.data && typeof event.data === "object") return event.data
+  if (event?.properties && typeof event.properties === "object") return event.properties
+  return event
+}
+
+function markCompactionAndOptions(
+  event: Pick<SessionContext, "sessionID" | "options">,
+  isCompaction: boolean,
+): void {
+  markCompactionSession(event.sessionID, isCompaction)
+  // Keep the request-local flag authoritative. Explicit false prevents a
+  // concurrent title/generate/primary request for the same session from
+  // inheriting the process-wide fallback marker.
+  event.options ??= {}
+  event.options[CURSOR_COMPACTION_OPTION] = isCompaction
+}
+
+const plugin: Plugin2 & { server: typeof CursorPlugin } = {
   id: "cursor.provider",
+  server: CursorPlugin,
 
   setup: async (ctx: PluginContext): Promise<Cleanup> => {
     const cacheDir = opencodeGlobalCacheDir()
+    const workspaceRoot = ctx.location?.directory || process.cwd()
+    const hasShellEnvHook = typeof ctx.shell?.hook === "function"
 
-    // The 2.0 SessionDomain has `prompt` but no agent-selection method, so it
-    // cannot faithfully reproduce classic plan_exit's `agent: "build"` kickoff.
-    // Leave the handler absent: the continuation reports an execution error and
-    // retains plan mode instead of returning false success.
-    setPlanExecutionKickoff(undefined)
+    const admitPlanKickoff = typeof ctx.session.synthetic === "function"
+      ? ctx.session.synthetic
+      : ctx.session.prompt
+    if (typeof ctx.session.switchAgent === "function" && typeof admitPlanKickoff === "function") {
+      const switchAgent = ctx.session.switchAgent
+      setPlanExecutionKickoff(async ({ sessionID, planPath }) => {
+        await switchAgent({ sessionID, agent: "build" })
+        try {
+          await admitPlanKickoff({
+            sessionID,
+            text: createPlanExecutionKickoffText(planPath),
+          })
+        } catch (error) {
+          // Switching and admitting input are separate public APIs. Restore the
+          // plan agent if admission fails so the shared retry state is honest:
+          // the plan remains active rather than silently leaving the session in
+          // build mode with no execution turn.
+          await switchAgent({ sessionID, agent: "plan" }).catch(() => {})
+          throw error
+        }
+      })
+    } else {
+      setPlanExecutionKickoff(undefined)
+    }
+
+    if (typeof ctx.session.switchAgent === "function") {
+      const switchAgent = ctx.session.switchAgent
+      setHostAgentModeSwitch(async ({ sessionID, targetModeID }) => {
+        const mode = normalizeSwitchModeId(targetModeID)
+        await switchAgent({
+          sessionID,
+          agent: mode === "plan" || mode === "spec" ? "plan" : "build",
+        })
+      })
+    } else {
+      setHostAgentModeSwitch(undefined)
+    }
 
     const registrations: Array<{ dispose: () => Promise<void> }> = []
     const track = async (p: Promise<{ dispose: () => Promise<void> }>) => {
@@ -89,10 +177,9 @@ const plugin: Plugin2 = {
     }
 
     let models: ModelInfo[] = []
-    const useCatalog = hasCatalogDomain(ctx)
-    let stableReloadPending = false
+    let sourceConnection: ConnectionInfo | undefined
 
-    // ── Credentials ──────────────────────────────────────────────────────────
+    // ── Credentials ─────────────────────────────────────────
     await track(ctx.integration.transform(applyCursorIntegration))
 
     let cachedToken: string | undefined
@@ -115,60 +202,53 @@ const plugin: Plugin2 = {
       return token
     }
 
-    // ── Catalog (beta) or config providers sync (stable 2.0.5) ───────────────
-    // Beta: transform replays on catalog.reload().
-    // Stable: no ctx.catalog — persist providers.cursor into the host config dir.
-    if (useCatalog && ctx.catalog) {
-      await track(
-        ctx.catalog.transform((draft) => {
-          applyCursorProvider(draft)
-          applyCursorModels(draft, models)
-        }),
-      )
-    } else {
-      // Seed from disk cache so picker is non-empty before /connect on repeat runs.
-      // Do not write an empty providers.cursor block (would clobber a good config).
+    const refreshSourceConnection = async (): Promise<void> => {
       try {
-        const cached = await readCache(cacheDir)
-        if (cached?.models?.length) {
-          models = cached.models
-          const seeded = await syncCursorProvidersConfigAndReload(models, {
-            provider: () => ctx.provider?.reload?.(),
-            model: () => ctx.model?.reload?.(),
-          })
-          if (!stableModelsPublished(seeded)) stableReloadPending = true
-        }
+        sourceConnection = await ctx.integration.connection.active(CURSOR_INTEGRATION_ID)
       } catch {
-        stableReloadPending = true
-        // Config write is best-effort; auth/aisdk still work without it.
+        sourceConnection = undefined
       }
     }
 
-    const publishModels = async (next: ModelInfo[]): Promise<boolean> => {
-      models = next
-      if (useCatalog && ctx.catalog) {
-        await ctx.catalog.reload().catch(() => {})
-        return true
+    // ── Provider inventory (in-memory `editor.add`) ─────────────────────
+    // Transform replays on provider.reload(). Skip while `models` is empty so
+    // the first registration is a no-op; discovery/cache then reload.
+    await track(
+      ctx.provider.transform((editor) => {
+        applyCursorProviderInventory(editor, models, sourceConnection)
+      }),
+    )
+
+    try {
+      const cached = await readCache(cacheDir)
+      if (cached?.models?.length) {
+        models = cached.models
+        await refreshSourceConnection()
+        await ctx.provider.reload()
       }
+    } catch {
+      // Cache seed is best-effort; auth/aisdk still work without it.
+    }
+
+    const publishModels = async (next: ModelInfo[]): Promise<boolean> => {
+      const previousModels = models
+      const previousConnection = sourceConnection
+      models = next
+      await refreshSourceConnection()
       try {
-        const result = await syncCursorProvidersConfigAndReload(next, {
-          provider: () => ctx.provider?.reload?.(),
-          model: () => ctx.model?.reload?.(),
-        }, { forceReload: stableReloadPending })
-        if (!stableModelsPublished(result)) {
-          stableReloadPending = true
-          return false
-        }
-        stableReloadPending = false
+        await ctx.provider.reload()
         return true
       } catch {
-        // Leave model loading retryable; auth/aisdk remain usable.
-        stableReloadPending = true
+        // Keep the transform backed by the last inventory that actually
+        // reloaded. A later host replay must not publish a failed account
+        // refresh merely because the candidate remained in this closure.
+        models = previousModels
+        sourceConnection = previousConnection
         return false
       }
     }
 
-    // ── AI SDK wiring ────────────────────────────────────────────────────────
+    // ── AI SDK wiring ────────────────────────────────────────
     await track(
       ctx.aisdk.hook("sdk", async (event) => {
         if (event.sdk) return
@@ -181,7 +261,7 @@ const plugin: Plugin2 = {
           // per session, and 2.0 runs one daemon across many projects — the
           // real per-request directory comes from the session.context hook
           // below via `getSessionDirectory`, which `language-model.ts` prefers.
-          workspaceRoot: process.cwd(),
+          workspaceRoot,
           cacheDir,
           ...event.options,
         } as CreateCursorOptions)
@@ -198,113 +278,92 @@ const plugin: Plugin2 = {
       }),
     )
 
-    // ── Web search ───────────────────────────────────────────────────────────
-    // Registered as a tool, matching the classic plugin. 2.0 also has a
-    // first-class `websearch` domain, but its Result shape is structured
-    // ({url, title?, content?}) while the Exa backend here returns an opaque
-    // text blob — mapping one to the other would mean guessing Exa's payload
-    // shape, so the tool form stays until that can be verified against a live
-    // response.
+    // ── Web search ───────────────────────────────────────────
+    // Publish an OpenCode 2.0 `websearch` provider (`{url,title,content,time}`).
+    // The classic entrypoint owns the permission-aware `custom_websearch`
+    // fallback; 2.0's public plugin tool context cannot request permission.
+    if (ctx.websearch) {
+      await track(
+        ctx.websearch.transform((draft) => {
+          draft.add({
+            id: "cursor-exa",
+            name: "Exa",
+            execute: async (input, context) => {
+              const output = await fetchOpenCodeWebSearchText(
+                { query: input.query },
+                context.signal,
+              )
+              return parseExaWebSearchResults(output)
+            },
+          })
+        }),
+      )
+    }
+
     await track(
       ctx.tool.transform((draft) => {
-        draft.add({
-          name: "custom_websearch",
-          description: "Search the web for current information using OpenCode's web search backend.",
-          input: {
-            type: "object",
-            properties: {
-              query: { type: "string", description: "Web search query" },
-              numResults: { type: "integer", minimum: 1, maximum: 20 },
-              livecrawl: { type: "string", enum: ["fallback", "preferred"] },
-              type: { type: "string", enum: ["auto", "fast", "deep"] },
-              contextMaxCharacters: { type: "integer", exclusiveMinimum: 0 },
-            },
-            required: ["query"],
-            additionalProperties: false,
-          },
-          execute: async (input: OpenCodeWebSearchArgs, context: any) => {
-            const output = await fetchOpenCodeWebSearchText(input, context?.abort)
-            return {
-              title: `Exa Web Search: ${input.query}`,
-              output,
-              metadata: { provider: "exa" },
-            }
-          },
-        })
-
-        // Same handle-only commit tool as classic plugin.ts. Uses host-neutral
-        // executeCursorImageSave (not image-save-tool.ts) so this entrypoint never
-        // imports `@opencode-ai/plugin`'s classic `tool()` helper.
-        draft.add({
-          name: CURSOR_IMAGE_SAVE_TOOL,
-          description:
-            "Save an image that Cursor generated during this session to its target path. "
-            + "Takes only the id of an already-generated image — it cannot write arbitrary "
-            + "files, and it is not a general-purpose file writer. You do not normally call "
-            + "this: the Cursor provider issues it after an image is generated.",
-          input: {
-            type: "object",
-            properties: {
-              image_id: {
-                type: "string",
-                description: "Id of the pending Cursor-generated image to save",
-              },
-            },
-            required: ["image_id"],
-            additionalProperties: false,
-          },
-          execute: async (input: { image_id?: string }, context: any) => {
-            const saveCtx: ImageSaveToolContext = {
-              worktree: typeof context?.worktree === "string" ? context.worktree : "",
-              directory: typeof context?.directory === "string" ? context.directory : "",
-              ask: typeof context?.ask === "function"
-                ? context.ask.bind(context)
-                : async () => {
-                  throw new Error(
-                    "OpenCode 2.0 tool context did not provide ask(); cannot gate image save",
-                  )
-                },
-            }
-            const result = await executeCursorImageSave(input, saveCtx)
-            if (typeof result === "string") {
-              return { title: CURSOR_IMAGE_SAVE_TOOL, output: result, metadata: {} }
-            }
-            const typed = result as ImageSaveResult
-            return {
-              title: typed.title,
-              output: typed.output,
-              metadata: {},
-            }
-          },
-        })
+        // OpenCode 2 dropped host todowrite/todoread. Off by default
+        // (`CURSOR_OPENCODE2_TODOS=1`/`true` force-enables). When on, register
+        // them as direct catalog tools (`codemode: false` + output schema) if
+        // the host does not already own those names. When off, register none.
+        registerTodoTools(draft)
       }),
     )
 
-    // ── Shell timeout wrapper ────────────────────────────────────────────────
+    // ── Shell timeout wrapper ────────────────────────────────
     await track(
       ctx.tool.hook("execute.before", (event) => {
-        if (event.tool !== "bash") return
+        if (!isShellTool(event.tool)) return
         const executionID = toolExecutionID(event)
-        // No `shell.env` in 2.0 → always use the wrapper-file command form.
         prepareCursorShellArgs(executionID, event.input as Record<string, unknown>, {
-          preferWrapperCommand: true,
+          // OpenCode 2.0 `shell.create.before` can inject env for bash/zsh.
+          preferWrapperCommand: !hasShellEnvHook,
         })
       }),
     )
 
     await track(
       ctx.tool.hook("execute.after", (event) => {
-        if (event.tool !== "bash") return
+        if (!isShellTool(event.tool)) return
         const executionID = toolExecutionID(event)
         try {
           if (event.status !== "completed") return
           const result = event.result as Record<string, any>
-          result.title = cursorShellOriginalCommand(executionID) ?? result.title
-          result.output = captureCursorShellResult(
-            executionID,
-            result.output,
-            result.metadata as Record<string, unknown> | undefined,
-          )
+          // V1: `output` is the model-facing string. V2: `output` is structured
+          // per-tool output (shell: `{ output: string, ... }`) and the
+          // model-facing text lives on `content`. Sanitize every string
+          // location; non-strings pass through via the guards in shell-timeout.
+          if (typeof result.output === "string") {
+            result.output = captureCursorShellResult(
+              executionID,
+              result.output,
+              result.metadata as Record<string, unknown> | undefined,
+            )
+          } else if (result.output && typeof result.output === "object") {
+            const structured = result.output as Record<string, unknown>
+            if (typeof structured.output === "string") {
+              structured.output = captureCursorShellResult(
+                executionID,
+                structured.output,
+                result.metadata as Record<string, unknown> | undefined,
+              )
+            }
+          }
+          if (typeof result.content === "string") {
+            result.content = sanitizeRegisteredCursorShellOutput(executionID, result.content)
+          } else if (Array.isArray(result.content)) {
+            result.content = result.content.map((item: unknown) => {
+              if (!item || typeof item !== "object") return item
+              const content = item as Record<string, unknown>
+              if (content.type !== "text" || typeof content.text !== "string") return item
+              return {
+                ...content,
+                text: sanitizeRegisteredCursorShellOutput(executionID, content.text),
+              }
+            })
+          } else if (typeof result.output === "string" && result.content === undefined) {
+            result.content = result.output
+          }
           if (result.metadata && typeof result.metadata === "object") {
             const metadata = result.metadata as Record<string, unknown>
             if (typeof metadata.output === "string") {
@@ -317,43 +376,97 @@ const plugin: Plugin2 = {
       }),
     )
 
-    // ── Compaction marker + session directory ───────────────────────────────
-    // 2.0 removed `chat.params`, and `session.hook("context")` exposes no
-    // provider-options channel — only `system`/`messages`/`tools` are mutable.
-    // But it does name the owning agent and the session id, and the provider
-    // already derives the same session id from request headers, so record
-    // both facts here and let doStream read them back via
-    // `isCompactionSession` / `getSessionDirectory`.
+    if (ctx.shell) {
+      await track(
+        ctx.shell.hook("create.before", (event) => {
+          const env = cursorShellEnvForCommand(event.command, event.cwd)
+          if (!env) return
+          event.env = { ...event.env, ...env }
+        }),
+      )
+    }
+
+    const rememberSessionDirectory = async (sessionID: string) => {
+      try {
+        const info = await ctx.session.get({ sessionID })
+        markSessionDirectory(sessionID, info.location?.directory)
+      } catch {
+        // Best effort — falls back to the static workspaceRoot above.
+      }
+    }
+
     await track(
       ctx.session.hook("context", async (event) => {
-        markCompactionSession(event.sessionID, event.agent === "compaction")
-        try {
-          const info = await ctx.session.get({ sessionID: event.sessionID })
-          markSessionDirectory(event.sessionID, info.location?.directory)
-        } catch {
-          // Best effort — falls back to the static workspaceRoot above.
+        markCompactionAndOptions(event, event.agent === "compaction")
+        event.options ??= {}
+        event.options[CURSOR_HOST_AGENT_OPTION] = event.agent
+        if (event.agent !== "compaction") {
+          const activeMode = getActiveCursorMode(event.sessionID)
+          if (event.agent === "plan") {
+            if (activeMode !== "plan" && activeMode !== "spec") {
+              setActiveCursorMode(event.sessionID, "plan")
+            }
+          } else if (activeMode === "plan" || activeMode === "spec") {
+            // A direct OpenCode UI switch away from Plan is authoritative. Do
+            // not overwrite other Cursor-only modes (chat/debug/etc.) merely
+            // because their closest native primary agent is `build`.
+            setActiveCursorMode(event.sessionID, "agent")
+          }
         }
+        await rememberSessionDirectory(event.sessionID)
       }),
     )
 
-    // ── Model discovery ──────────────────────────────────────────────────────
-    // Idempotent and cheap once satisfied, so it is safe to call from anywhere
-    // that might mark the moment credentials became available.
+    await track(
+      ctx.session.hook("compaction", async (event) => {
+        markCompactionAndOptions(event, true)
+        await rememberSessionDirectory(event.sessionID)
+      }),
+    )
+
+    await track(
+      ctx.session.hook("generate", async (event) => {
+        markCompactionAndOptions(event, false)
+        await rememberSessionDirectory(event.sessionID)
+      }),
+    )
+
+    await track(
+      ctx.session.hook("title", async (event) => {
+        markCompactionAndOptions(event, false)
+        await rememberSessionDirectory(event.sessionID)
+      }),
+    )
+
+    // ── Model discovery ────────────────────────────────────────
     let modelsLoaded = false
+    let credentialGeneration = 0
+    let loadedCredentialGeneration = 0
     let ensureInflight: Promise<void> | undefined
     const ensureModels = (): Promise<void> => {
-      if (modelsLoaded) return Promise.resolve()
-      ensureInflight ??= (async () => {
+      if (modelsLoaded && loadedCredentialGeneration === credentialGeneration) {
+        return Promise.resolve()
+      }
+      // If credentials change during an existing discovery, wait for that
+      // attempt and immediately run again. The generation check prevents the
+      // older attempt from suppressing the account-scoped refresh.
+      if (ensureInflight) return ensureInflight.then(() => ensureModels())
+
+      const attemptGeneration = credentialGeneration
+      const forceRefresh = loadedCredentialGeneration !== attemptGeneration
+      ensureInflight = (async () => {
         try {
           const token = await accessToken()
-          const discovered = await loadModels(cacheDir, token)
+          const discovered = await loadModels(cacheDir, token, forceRefresh)
           if (!discovered.length) return
+          if (credentialGeneration !== attemptGeneration) return
           if (!await publishModels(discovered)) return
+          // A newer credential event arrived while this request was in flight.
+          // Keep the state dirty so the chained ensure uses the latest token.
+          if (credentialGeneration !== attemptGeneration) return
           modelsLoaded = true
+          loadedCredentialGeneration = attemptGeneration
           if (token) {
-            // Resolve the region-specific Run origin so the first turn doesn't
-            // pay for GetServerConfig. Best effort: startSession surfaces real
-            // failures.
             await resolveAgentUrl(token, {
               apiBaseURL: cursorApiBaseURL(),
               telemetryEnabled: cursorGetServerConfigTelemetryEnabled(),
@@ -366,10 +479,6 @@ const plugin: Plugin2 = {
       return ensureInflight
     }
 
-    // On a fresh install the user connects *after* startup, and the host has no
-    // "connection established" hook we can key on. Poll briefly so models show
-    // up within seconds of /connect instead of requiring a restart. The window
-    // is bounded; after it, any session/message event still triggers a retry.
     const RETRY_INTERVAL_MS = 3_000
     const RETRY_WINDOW_MS = 300_000
     const startedAt = Date.now()
@@ -378,22 +487,25 @@ const plugin: Plugin2 = {
         clearInterval(retry)
         return
       }
-      void ensureModels()
+      void ensureModels().catch(() => {})
     }, RETRY_INTERVAL_MS)
-    // Do not hold the process open on this timer.
     ;(retry as unknown as { unref?: () => void }).unref?.()
 
-    void ensureModels()
+    void ensureModels().catch(() => {})
 
-    // ── Session activity ─────────────────────────────────────────────────────
-    // Doubles as a retry trigger: any host activity after the polling window has
-    // closed still gets one more chance to pick up newly-added credentials.
-    const unsubscribe = subscribeSessionActivity(ctx, ensureModels)
+    const onCredentialSwitch = () => {
+      cachedToken = undefined
+      modelsLoaded = false
+      credentialGeneration++
+    }
+
+    const unsubscribe = subscribeSessionActivity(ctx, ensureModels, onCredentialSwitch)
 
     return async () => {
       clearInterval(retry)
       unsubscribe?.()
       setPlanExecutionKickoff(undefined)
+      setHostAgentModeSwitch(undefined)
       for (const registration of registrations.reverse()) {
         await registration.dispose().catch(() => {})
       }
@@ -401,10 +513,10 @@ const plugin: Plugin2 = {
   },
 }
 
-/** Feed OpenCode session/message events into the shared activity tracker. */
 function subscribeSessionActivity(
   ctx: PluginContext,
   onEvent?: () => void,
+  onCredentialSwitch?: () => void,
 ): (() => void) | undefined {
   try {
     const stream = ctx.event.subscribe()
@@ -413,7 +525,7 @@ function subscribeSessionActivity(
     void (async () => {
       for await (const event of stream as AsyncIterable<any>) {
         if (stopped) break
-        applySessionActivity(event)
+        applySessionActivity(event, onCredentialSwitch)
         onEvent?.()
       }
     })().catch(() => {})
@@ -425,24 +537,68 @@ function subscribeSessionActivity(
   }
 }
 
-function applySessionActivity(event: any): void {
+function applySessionActivity(event: any, onCredentialSwitch?: () => void): void {
+  const payload = eventPayload(event)
+  const info = payload?.info
   switch (event?.type) {
+    case "credential.switched":
+    case "credential.updated": {
+      const integrationID = payload?.integrationID
+      if (!integrationID || integrationID === CURSOR_INTEGRATION_ID || integrationID === CURSOR_PROVIDER_ID) {
+        onCredentialSwitch?.()
+      }
+      break
+    }
     case "session.created":
-      sessionActivity.linkSession(event.properties.info.id, event.properties.info.parentID)
-      sessionActivity.recordActivity(event.properties.info.id)
-      break
     case "session.updated":
-      sessionActivity.linkSession(event.properties.info.id, event.properties.info.parentID)
+    case "session.forked": {
+      const id = payload?.sessionID ?? info?.id
+      const parentID = payload?.parentID ?? info?.parentID
+      if (id) {
+        sessionActivity.linkSession(id, parentID)
+        if (event.type === "session.created") sessionActivity.recordActivity(id)
+      }
       break
-    case "session.deleted":
-      sessionActivity.removeSession(event.properties.info.id)
+    }
+    case "session.deleted": {
+      const id = payload?.sessionID ?? info?.id
+      if (id) {
+        sessionActivity.removeSession(id)
+        clearSessionTodos(id)
+        clearActiveCursorMode(id)
+        cancelPlanExecutionKickoff(id)
+        cancelHostAgentModeSwitch(id)
+      }
       break
-    case "message.updated":
-      sessionActivity.recordActivity(event.properties.info.sessionID)
+    }
+    case "message.updated": {
+      const id = payload?.sessionID ?? info?.sessionID
+      if (id) sessionActivity.recordActivity(id)
       break
-    case "message.part.updated":
-      sessionActivity.recordActivity(event.properties.part.sessionID)
+    }
+    case "message.part.updated": {
+      const id = payload?.sessionID ?? payload?.part?.sessionID ?? info?.sessionID
+      if (id) sessionActivity.recordActivity(id)
       break
+    }
+    case "session.usage.updated":
+    case "session.usage.recorded": {
+      const id = payload?.sessionID
+      if (id) sessionActivity.recordActivity(id)
+      break
+    }
+    default: {
+      // OpenCode 2.0 emits granular `session.*` progress events instead of
+      // the V1 `message.updated` family (`session.tool.called/success/failed`,
+      // `session.step.*`, `session.text.*`, `session.execution.*`, ...). Any of
+      // them proves the session is alive and renews a pending-tool lease.
+      const type = typeof event?.type === "string" ? event.type : ""
+      if (type.startsWith("session.") && type !== "session.deleted") {
+        const id = payload?.sessionID ?? info?.sessionID ?? info?.id
+        if (id) sessionActivity.recordActivity(id)
+      }
+      break
+    }
   }
 }
 

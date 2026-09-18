@@ -8,7 +8,7 @@
  * Display `switch_mode_tool_call` (#25) is a separate transcript record and is
  * not replayed as a host tool.
  *
- * Host mapping (advertisement-gated):
+ * OpenCode 1.x mapping (advertisement-gated):
  * - plan, spec → plan_enter
  * - every other non-empty target → plan_exit (leave plan for OpenCode build),
  *   then inject the Cursor CLI-shaped mode reminder for that target
@@ -19,9 +19,10 @@
  * `setAgentModel` primary-agent switch (opencode `tool/plan.ts`,
  * `session/prompt.ts`). A provider cannot reach `setAgentModel`, but the two
  * observable halves — the approval gate and the behavioural contract — are both
- * reachable, so the bridge degrades instead of refusing when the host tool is
- * missing (`plan_enter` is commented out upstream and `plan_exit` is gated
- * behind OPENCODE_EXPERIMENTAL_PLAN_MODE + CLI client):
+ * reachable, so the protocol bridge degrades instead of refusing when the host
+ * tool is missing. OpenCode 2 additionally exposes `session.switchAgent`; its
+ * entrypoint installs a structural callback that selects the native `plan` or
+ * `build` primary agent after the owning Cursor Run becomes terminal:
  *
  * - entering plan/spec needs no host tool at all — approve immediately and let
  *   the injected <system_reminder> carry the contract, exactly as Cursor CLI's
@@ -126,6 +127,7 @@ type ActiveCursorModeState = {
 }
 
 const activeCursorModeBySession = new Map<string, ActiveCursorModeState>()
+const MAX_ACTIVE_CURSOR_MODES = 256
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -343,6 +345,11 @@ export function setActiveCursorMode(
     firstTurn: true,
     bridgedPlanEntered: options.bridgedPlanEntered === true,
   })
+  while (activeCursorModeBySession.size > MAX_ACTIVE_CURSOR_MODES) {
+    const oldest = activeCursorModeBySession.keys().next().value as string | undefined
+    if (!oldest) break
+    activeCursorModeBySession.delete(oldest)
+  }
 }
 
 export function getActiveCursorMode(sessionKey: string | undefined): string | undefined {

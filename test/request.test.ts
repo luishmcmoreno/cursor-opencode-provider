@@ -179,10 +179,10 @@ describe("buildRunRequest", () => {
     const descriptors = rc.mcp_file_system_options.mcp_descriptors
     expect(descriptors.map((d: any) => d.server_identifier)).toEqual([
       "opencode",
-      "github",
       "brave",
+      "github",
     ])
-    expect(descriptors[1].tools[0].tool_name).toBe("create_pull_request")
+    expect(descriptors[2].tools[0].tool_name).toBe("create_pull_request")
     expect(rc.mcp_meta_tool_options.mcp_descriptors).toHaveLength(3)
   })
 

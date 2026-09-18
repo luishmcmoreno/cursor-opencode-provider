@@ -4,6 +4,8 @@ export const FALLBACK_CLIENT_VERSION = "cli-2026.07.09-a3815c0"
 export const CURSOR_PROVIDER_ID = "cursor"
 /** Private provider option injected by the OpenCode plugin for summary turns. */
 export const CURSOR_COMPACTION_OPTION = "opencodeCompaction"
+/** Current OpenCode primary agent; used to invalidate incompatible checkpoints. */
+export const CURSOR_HOST_AGENT_OPTION = "opencodeHostAgent"
 export const TOKEN_EXPIRY_THRESHOLD_S = 300
 
 export const RUN_PATH = "/agent.v1.AgentService/Run"
@@ -15,7 +17,7 @@ export const MODEL_CACHE_FILE = "cursor-models.json"
 export const MODEL_CACHE_SCHEMA_VERSION = 3
 export const MODEL_CACHE_TTL_MS = 86_400_000
 export const CONVERSATION_CACHE_DIR = "cursor-conversations"
-export const CONVERSATION_CACHE_SCHEMA_VERSION = 3
+export const CONVERSATION_CACHE_SCHEMA_VERSION = 4
 export const CONVERSATION_CACHE_TTL_MS = 86_400_000
 export const VERSION_CACHE_FILE = "cursor-client-version.json"
 

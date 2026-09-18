@@ -98,6 +98,31 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("verify uncertain paths")
   })
 
+  it("distinguishes OpenCode execute Code Mode from the shell tool", () => {
+    const withShell = buildOpenCodeInteractionGuidance([
+      { name: "execute" },
+      { name: "shell" },
+      { name: "read" },
+    ], false, "/workspace/project")
+    expect(withShell).toContain("OpenCode `execute` is Code Mode JavaScript (`code`)")
+    expect(withShell).toContain("it is not a shell")
+    expect(withShell).toContain("call OpenCode `shell`")
+    expect(withShell).toContain("Do not pass `command` to `execute`")
+
+    const withBash = buildOpenCodeInteractionGuidance([
+      { name: "execute" },
+      { name: "bash" },
+    ], false, "/workspace/project")
+    expect(withBash).toContain("call OpenCode `bash`")
+
+    const executeOnly = buildOpenCodeInteractionGuidance([
+      { name: "execute" },
+    ], false, "/workspace/project")
+    expect(executeOnly).toContain("Do not pass `command` to `execute`")
+    expect(executeOnly).not.toContain("call OpenCode `shell`")
+    expect(executeOnly).not.toContain("call OpenCode `bash`")
+  })
+
   it("prefers edit and write over shell file mutation", () => {
     const guidance = buildOpenCodeInteractionGuidance([
       { name: "bash" },
@@ -129,6 +154,24 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("`bugbot`, `security-review`, and `explore` select host `explore`")
     expect(guidance).toContain("Host `scout` is available")
     expect(guidance).toContain("local repository discovery still uses `bugbot`/`explore`")
+  })
+
+  it("documents Cursor-native Task routing through OpenCode 2 subagent", () => {
+    const guidance = buildOpenCodeInteractionGuidance([
+      {
+        name: "subagent",
+        description: "Available subagents: - explore: Fast. - general: General-purpose.",
+        inputSchema: {
+          properties: {
+            agent: { type: "string" },
+          },
+        },
+      },
+    ], false, "/workspace/project")
+
+    expect(guidance).toContain("Native Cursor Task/subagent requests are executed through OpenCode `subagent`")
+    expect(guidance).toContain("Spawnable host agents this turn: `explore`, `general`.")
+    expect(guidance).not.toContain("OpenCode `task`")
   })
 })
 

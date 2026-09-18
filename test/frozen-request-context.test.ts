@@ -20,6 +20,11 @@ import {
 import { resetCheckpointsForTests } from "../src/protocol/checkpoint.js"
 import { resetConversationBlobsForTests } from "../src/protocol/blob-store.js"
 import { HOST_PATH_BRIDGE, setHostCacheDirOverride } from "../src/context/paths.js"
+import { resetConversationPersistenceForTests } from "../src/protocol/conversation-persistence.js"
+import {
+  hydrateConversationState,
+  persistConversationState,
+} from "../src/protocol/conversation-state.js"
 
 function sha(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex")
@@ -81,6 +86,7 @@ describe("frozen request_context", () => {
     resetConversationBindingsForTests()
     resetCheckpointsForTests()
     resetConversationBlobsForTests()
+    resetConversationPersistenceForTests()
   })
 
   it("builds once then reuses the same object across calls", async () => {
@@ -188,6 +194,74 @@ describe("frozen request_context", () => {
     expect(changed.context).not.toBe(stable.context)
     expect((changed.context.tools as Array<Record<string, unknown>>)[0]?.tool_name)
       .toBe("read")
+  })
+
+  it("reuses the prefix when the host enumerates the same tools in a different order", async () => {
+    const conversationId = "conv-freeze-tool-order"
+    const tools = [
+      { name: "read", description: "Read a file" },
+      { name: "github_get_me", description: "Get the current user" },
+      { name: "bash", description: "Run a shell command" },
+    ]
+    await writeFile(path.join(root, "opencode.json"), JSON.stringify({
+      mcp: { github: { type: "remote" } },
+    }))
+    try {
+      const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
+      const reordered = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        tools: [...tools].reverse(),
+      })
+
+      expect(reordered.reused).toBe(true)
+      expect(reordered.context).toBe(first.context)
+      expect(sha(encodeRequestContext(reordered.context)))
+        .toBe(sha(encodeRequestContext(first.context)))
+    } finally {
+      await rm(path.join(root, "opencode.json"), { force: true })
+    }
+  })
+
+  it("rebuilds a byte-identical prefix after durable restart hydration", async () => {
+    const sessionKey = "ses-freeze-restart"
+    const conversationId = bindConversationId(sessionKey).conversationId
+    const tools = [
+      { name: "read", description: "Read a file" },
+      { name: "bash", description: "Run a shell command" },
+    ]
+    const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
+    const firstHash = sha(encodeRequestContext(first.context))
+    await persistConversationState(cacheRoot, {
+      sessionKey,
+      conversationId,
+      requestContext: first.context,
+      toolCatalog: tools,
+    })
+
+    resetConversationPersistenceForTests()
+    resetConversationBindingsForTests()
+    resetCheckpointsForTests()
+    resetConversationBlobsForTests()
+    resetFrozenRequestContextsForTests()
+
+    const hydrated = await hydrateConversationState(cacheRoot, sessionKey)
+    expect(hydrated?.conversationId).toBe(conversationId)
+    expect(hydrated?.toolCatalog).toEqual(tools)
+    const rebuilt = await getOrBuildRequestContext(conversationId, {
+      workspaceRoot: root,
+      tools: hydrated!.toolCatalog,
+    })
+
+    // A process restart cannot retain object identity, but it must retain the
+    // exact serialized prefix. Subsequent in-process calls regain object reuse.
+    expect(rebuilt.reused).toBe(false)
+    expect(sha(encodeRequestContext(rebuilt.context))).toBe(firstHash)
+    const reused = await getOrBuildRequestContext(conversationId, {
+      workspaceRoot: root,
+      tools: hydrated!.toolCatalog,
+    })
+    expect(reused.reused).toBe(true)
+    expect(reused.context).toBe(rebuilt.context)
   })
 
   it("removes tools on an ordinary restricted/no-tool turn", async () => {

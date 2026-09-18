@@ -74,10 +74,15 @@ export type PlanExecutionKickoffState = PlanExecutionKickoffInput & {
 }
 const pending = new Map<string, PlanExecutionKickoffState>()
 const warnings = new Map<string, string>()
+const MAX_PENDING_PLAN_KICKOFFS = 256
 
 /** Install (or clear) the host kickoff. */
 export function setPlanExecutionKickoff(fn: PlanExecutionKickoffFn | undefined): void {
   kickoff = fn
+  if (!fn) {
+    pending.clear()
+    warnings.clear()
+  }
 }
 
 export function hasPlanExecutionKickoff(): boolean {
@@ -103,11 +108,25 @@ export function queuePlanExecutionKickoff(input: PlanExecutionKickoffInput): boo
     attempts: 0,
   })
   warnings.delete(sessionID)
+  while (pending.size > MAX_PENDING_PLAN_KICKOFFS) {
+    const oldest = pending.keys().next().value as string | undefined
+    if (!oldest) break
+    pending.delete(oldest)
+    warnings.delete(oldest)
+  }
   trace(
     `plan-execution-kickoff: pending sessionID=${sessionID} ` +
       `cursorSessionID=${input.cursorSessionID ?? ""} planPath=${planPath}`,
   )
   return true
+}
+
+/** Drop any approval state owned by a deleted host session. */
+export function cancelPlanExecutionKickoff(sessionID: string | undefined): void {
+  const key = sessionID?.trim()
+  if (!key) return
+  pending.delete(key)
+  warnings.delete(key)
 }
 
 /**
@@ -139,8 +158,12 @@ export async function flushPlanExecutionKickoff(
     && options.cursorSessionID
     && state.cursorSessionID !== options.cursorSessionID
   ) {
+    // The owning Run was superseded before the handoff could happen. Applying
+    // it from a later Run would execute a stale approval in the wrong turn.
+    pending.delete(key)
+    warnings.delete(key)
     trace(
-      `plan-execution-kickoff: skipped stale Run sessionID=${key} ` +
+      `plan-execution-kickoff: discarded stale Run sessionID=${key} ` +
         `owner=${state.cursorSessionID} terminal=${options.cursorSessionID}`,
     )
     return false

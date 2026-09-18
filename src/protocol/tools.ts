@@ -38,6 +38,84 @@ export type OpencodeToolDef = {
   sourceName?: string
 }
 
+/** Host file-tool argument key. OpenCode 1.x uses `filePath`; 2.0 uses `path`. */
+export type HostFilePathKey = "path" | "filePath"
+/** Host shell tool id. OpenCode 1.x uses `bash`; 2.0 uses `shell`. */
+export type HostShellTool = "bash" | "shell"
+export type HostToolDialect = {
+  filePathKey: HostFilePathKey
+  shellTool: HostShellTool
+}
+export const OPENCODE_1_TOOL_DIALECT: HostToolDialect = {
+  filePathKey: "filePath",
+  shellTool: "bash",
+}
+
+function jsonSchemaProperties(schema: unknown): Record<string, unknown> | undefined {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return undefined
+  const obj = schema as Record<string, unknown>
+  if (obj.properties && typeof obj.properties === "object" && !Array.isArray(obj.properties)) {
+    return obj.properties as Record<string, unknown>
+  }
+  const nested = obj.jsonSchema
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+    const props = (nested as Record<string, unknown>).properties
+    if (props && typeof props === "object" && !Array.isArray(props)) {
+      return props as Record<string, unknown>
+    }
+  }
+  return undefined
+}
+
+/** Prefer `filePath`, then `path` / `file_path` — Cursor and both OpenCode majors. */
+export function opencodePathArg(args: Record<string, unknown> | undefined): string | undefined {
+  if (!args) return undefined
+  return str(args.filePath) ?? str(args.path) ?? str(args.file_path)
+}
+
+/**
+ * Infer the host tool dialect from advertised AI SDK schemas.
+ * OpenCode 2.0 read/edit/write require `path` and rename bash → `shell`.
+ */
+export function hostToolDialectFromTools(
+  tools: readonly { name?: string; inputSchema?: unknown }[],
+): HostToolDialect {
+  let filePathKey: HostFilePathKey | undefined
+  for (const name of ["read", "write", "edit"] as const) {
+    const tool = tools.find((candidate) => candidate.name === name)
+    const props = jsonSchemaProperties(tool?.inputSchema)
+    if (!props) continue
+    if ("path" in props && !("filePath" in props)) {
+      filePathKey = "path"
+      break
+    }
+    if ("filePath" in props) {
+      filePathKey = "filePath"
+      break
+    }
+  }
+  const names = new Set(
+    tools.map((tool) => tool.name).filter((name): name is string => typeof name === "string"),
+  )
+  const shellTool: HostShellTool = names.has("shell") && !names.has("bash") ? "shell" : "bash"
+  if (!filePathKey) {
+    // OpenCode 2 hosts advertise `shell` and `path` together; use that when schemas are opaque.
+    filePathKey = shellTool === "shell" ? "path" : "filePath"
+  }
+  return { filePathKey, shellTool }
+}
+
+function assignHostFilePath(
+  args: Record<string, unknown>,
+  filePath: string | undefined,
+  dialect: HostToolDialect,
+): void {
+  delete args.filePath
+  delete args.path
+  delete args.file_path
+  if (filePath) args[dialect.filePathKey] = filePath
+}
+
 export const CUSTOM_WEBSEARCH_TOOL = "custom_websearch"
 export const CUSTOM_WEBFETCH_TOOL = "custom_webfetch"
 export const CUSTOM_LIST_MCP_RESOURCES_TOOL = "custom_list_mcp_resources"
@@ -245,16 +323,18 @@ export function toolsToMcpDescriptors(
 ): Array<Record<string, unknown>> {
   if (tools.length === 0) return []
 
-  const order: string[] = []
   const byServer = new Map<string, Array<Record<string, unknown>>>()
 
-  for (const t of tools) {
+  // OpenCode's tool catalog is a set even though the hook exposes it as an
+  // array. Keep both the server and per-server tool order canonical so a host
+  // that enumerates the same catalog differently does not invalidate Cursor's
+  // RequestContext prefix cache.
+  for (const t of [...tools].sort((left, right) => left.name.localeCompare(right.name))) {
     const id = resolveToolServerIdentity(t.sourceName ?? t.name, providerIdentifier, knownMcpServers)
     let list = byServer.get(id.server)
     if (!list) {
       list = []
       byServer.set(id.server, list)
-      order.push(id.server)
     }
     list.push({
       tool_name: t.sourceName ? t.name : id.toolName,
@@ -263,7 +343,12 @@ export function toolsToMcpDescriptors(
     })
   }
 
-  return order.map((server) => ({
+  const orderedServers = [...byServer.keys()].sort((left, right) => {
+    if (left === providerIdentifier) return right === providerIdentifier ? 0 : -1
+    if (right === providerIdentifier) return 1
+    return left.localeCompare(right)
+  })
+  return orderedServers.map((server) => ({
     server_name: server,
     server_identifier: server,
     tools: byServer.get(server)!,
@@ -346,6 +431,7 @@ const opencodeToolToCursor: Record<string, string> = {
   write: "write_args",
   grep: "grep_args",
   bash: "shell_stream_args",
+  shell: "shell_stream_args",
   task: "subagent_args",
   mcp: "mcp_args",
 }
@@ -443,13 +529,14 @@ export type HostSubagentDefinition = {
 }
 
 export type HostSubagentCatalog = {
-  executor?: "task"
+  executor?: "task" | "subagent"
   agents: HostSubagentDefinition[]
-  /** True when the OpenCode task tool supplied its complete, permission-filtered catalog. */
+  /** True when the OpenCode task/subagent tool supplied its complete, permission-filtered catalog. */
   complete: boolean
 }
 
 const SUBAGENT_CATALOG_MARKER = "Available agent types and the tools they have access to:"
+const SUBAGENT_INLINE_MARKER = "Available subagents:"
 
 function parseSubagentDescriptionCatalog(description: string | undefined): {
   found: boolean
@@ -457,27 +544,47 @@ function parseSubagentDescriptionCatalog(description: string | undefined): {
 } {
   if (!description) return { found: false, agents: [] }
   const marker = description.indexOf(SUBAGENT_CATALOG_MARKER)
-  if (marker < 0) return { found: false, agents: [] }
-
-  const agents: HostSubagentDefinition[] = []
-  const lines = description.slice(marker + SUBAGENT_CATALOG_MARKER.length).split(/\r?\n/)
-  let started = false
-  for (const line of lines) {
-    const match = line.match(/^\s*-\s+([^:]+):\s*(.*)$/)
-    if (!match) {
-      if (started && line.trim()) break
-      continue
+  if (marker >= 0) {
+    const agents: HostSubagentDefinition[] = []
+    const lines = description.slice(marker + SUBAGENT_CATALOG_MARKER.length).split(/\r?\n/)
+    let started = false
+    for (const line of lines) {
+      const match = line.match(/^\s*-\s+([^:]+):\s*(.*)$/)
+      if (!match) {
+        if (started && line.trim()) break
+        continue
+      }
+      started = true
+      const name = match[1]!.trim().replace(/^`|`$/g, "")
+      if (!name) continue
+      const agentDescription = match[2]!.trim()
+      agents.push({
+        name,
+        ...(agentDescription ? { description: agentDescription } : {}),
+      })
     }
-    started = true
-    const name = match[1]!.trim().replace(/^`|`$/g, "")
-    if (!name) continue
-    const agentDescription = match[2]!.trim()
+    return { found: true, agents }
+  }
+
+  // OpenCode 2 `subagent` inlines the list after "Available subagents:".
+  const inlineAt = description.indexOf(SUBAGENT_INLINE_MARKER)
+  if (inlineAt < 0) return { found: false, agents: [] }
+  const rest = description.slice(inlineAt + SUBAGENT_INLINE_MARKER.length)
+  const agents: HostSubagentDefinition[] = []
+  const matches = rest.matchAll(/-\s+([A-Za-z0-9_-]+):\s*/g)
+  const hits = [...matches]
+  for (let i = 0; i < hits.length; i++) {
+    const hit = hits[i]!
+    const name = hit[1]!
+    const start = (hit.index ?? 0) + hit[0].length
+    const end = i + 1 < hits.length ? (hits[i + 1]!.index ?? rest.length) : rest.length
+    const agentDescription = rest.slice(start, end).trim()
     agents.push({
       name,
       ...(agentDescription ? { description: agentDescription } : {}),
     })
   }
-  return { found: true, agents }
+  return { found: agents.length > 0, agents }
 }
 
 function subagentTypeEnumValues(schema: unknown): string[] {
@@ -493,7 +600,10 @@ function subagentTypeEnumValues(schema: unknown): string[] {
     }
 
     const record = value as Record<string, unknown>
-    if (propertyName === "subagent_type" && Array.isArray(record.enum)) {
+    if (
+      (propertyName === "subagent_type" || propertyName === "agent")
+      && Array.isArray(record.enum)
+    ) {
       for (const item of record.enum) {
         if (typeof item === "string" && item) out.add(item)
       }
@@ -506,18 +616,20 @@ function subagentTypeEnumValues(schema: unknown): string[] {
 
 /** Extract the current host's permission-filtered Task/Actor recipient catalog. */
 export function extractHostSubagentCatalog(tools: OpencodeToolDef[]): HostSubagentCatalog {
-  const executorTool = tools.find((tool) => tool.name === "task")
+  const executorTool =
+    tools.find((tool) => tool.name === "task")
+    ?? tools.find((tool) => tool.name === "subagent")
   if (!executorTool) return { agents: [], complete: true }
 
   const described = parseSubagentDescriptionCatalog(executorTool.description)
   const enumNames = subagentTypeEnumValues(executorTool.inputSchema)
   const descriptions = new Map(described.agents.map((agent) => [agent.name, agent.description]))
-  // A structured subagent_type enum is stricter than prose, so it is authoritative.
+  // A structured subagent_type/agent enum is stricter than prose, so it is authoritative.
   const names = new Set(
     enumNames.length > 0 ? enumNames : described.agents.map((agent) => agent.name),
   )
   return {
-    executor: "task",
+    executor: executorTool.name === "subagent" ? "subagent" : "task",
     agents: [...names].map((name) => ({
       name,
       ...(descriptions.get(name) ? { description: descriptions.get(name) } : {}),
@@ -589,13 +701,19 @@ export function remapNativeSubagentForCatalog(
 ): void {
   if (parsed.resultField !== "subagent_result" || parsed.toolName !== "task") return
   const advertised = new Set(advertisedToolNames)
-  if (!advertised.has("task")) return
-  const executor = "task" as const
+  const executor: "task" | "subagent" | undefined = advertised.has("task")
+    ? "task"
+    : advertised.has("subagent")
+      ? "subagent"
+      : undefined
+  if (!executor) return
 
   const description = str(parsed.args.description) ?? ""
   const prompt = str(parsed.args.prompt) ?? ""
   const cursorSubagentType = str(parsed.resultMetadata?.cursor_subagent_type) ??
-    str(parsed.args.subagent_type) ?? ""
+    str(parsed.args.subagent_type) ??
+    str(parsed.args.agent) ??
+    ""
   const subagentType = resolveCursorSubagentType(cursorSubagentType, catalog)
   if (!subagentType) {
     const available = catalog?.agents.map((agent) => agent.name).join(", ") || "none"
@@ -605,15 +723,23 @@ export function remapNativeSubagentForCatalog(
     return
   }
 
-  const resumeAgentId = str(parsed.args.task_id)
+  const resumeAgentId = str(parsed.args.task_id) ?? str(parsed.args.sessionID)
   parsed.toolName = executor
-  parsed.args = {
-    description,
-    prompt,
-    subagent_type: subagentType,
-    ...(resumeAgentId ? { task_id: resumeAgentId } : {}),
-    ...(parsed.args.background === true ? { background: true } : {}),
-  }
+  parsed.args = executor === "subagent"
+    ? {
+        agent: subagentType,
+        description,
+        prompt,
+        ...(resumeAgentId ? { sessionID: resumeAgentId } : {}),
+        ...(parsed.args.background === true ? { background: true } : {}),
+      }
+    : {
+        description,
+        prompt,
+        subagent_type: subagentType,
+        ...(resumeAgentId ? { task_id: resumeAgentId } : {}),
+        ...(parsed.args.background === true ? { background: true } : {}),
+      }
 }
 
 /** Matches Cursor's own pre-write read threshold (`local-exec` 52428800). */
@@ -756,7 +882,7 @@ export function remapCorrelatedEditWriteForCatalog(
   const advertised = new Set(advertisedToolNames)
   if (!advertised.has("edit") && !advertised.has(APPLY_PATCH_TOOL)) return false
 
-  const filePath = str(parsed.args.filePath)
+  const filePath = opencodePathArg(parsed.args)
   const content = stringValue(parsed.args.content)
   if (!filePath || content === undefined || !editPath) return false
 
@@ -779,8 +905,12 @@ export function remapCorrelatedEditWriteForCatalog(
   const replacement = planWholeFileEdit(source, content)
   if (!replacement) return false
   parsed.toolName = "edit"
+  const filePathKey: HostFilePathKey =
+    typeof parsed.args.path === "string" && typeof parsed.args.filePath !== "string"
+      ? "path"
+      : "filePath"
   parsed.args = {
-    filePath,
+    [filePathKey]: filePath,
     oldString: replacement.oldString,
     newString: replacement.newString,
   }
@@ -818,7 +948,7 @@ export function remapEditToolsForCatalog(
   if (advertised.has(parsed.toolName) || !advertised.has(APPLY_PATCH_TOOL)) return
 
   const requested = parsed.toolName
-  const filePath = str(parsed.args.filePath)
+  const filePath = opencodePathArg(parsed.args)
   const refuse = (reason: string) => {
     parsed.toolName = APPLY_PATCH_TOOL
     parsed.args = {}
@@ -928,9 +1058,7 @@ export function rejectPartialReadMutation(parsed: ParsedExecRequest): void {
     || !content.includes("It is NOT the complete file.")
   ) return
 
-  const filePath = typeof parsed.args.filePath === "string"
-    ? parsed.args.filePath
-    : "the target file"
+  const filePath = opencodePathArg(parsed.args) ?? "the target file"
   const nextOffset = /Continue with offset=(\d+)/.exec(content)?.[1]
   parsed.localError =
     `NO FILE CHANGE WAS MADE. Refusing a whole-file mutation of ${JSON.stringify(filePath)} ` +
@@ -942,6 +1070,7 @@ export function rejectPartialReadMutation(parsed: ParsedExecRequest): void {
 
 export function parseExecServerMessage(
   msg: Record<string, unknown>,
+  dialect: HostToolDialect = OPENCODE_1_TOOL_DIALECT,
 ): ParsedExecRequest | undefined {
   const id = msg.id as number | undefined
   if (id === undefined) return undefined
@@ -977,7 +1106,7 @@ export function parseExecServerMessage(
     return {
       id,
       execId,
-      toolName: "bash",
+      toolName: dialect.shellTool,
       args,
       resultField,
       resultMetadata: {
@@ -1033,7 +1162,7 @@ export function parseExecServerMessage(
     // tool name (Cursor's model may have shortened "opencode-read" → "read") and
     // decode the argument map back into JSON for opencode to execute.
     const m = (msg.mcp_args as Record<string, unknown>) ?? {}
-    const mapped = mapCursorArgsToOpencode(mcpRealToolName(m), decodeMcpArgs(m.args), "mcp_args")
+    const mapped = mapCursorArgsToOpencode(mcpRealToolName(m), decodeMcpArgs(m.args), "mcp_args", dialect)
     return {
       id,
       execId,
@@ -1053,7 +1182,7 @@ export function parseExecServerMessage(
     const oldString = replacement ? stringValue(replacement.old_text) : undefined
     const newString = replacement ? stringValue(replacement.new_text) : undefined
     const args: Record<string, unknown> = {}
-    if (path) args.filePath = path
+    assignHostFilePath(args, path, dialect)
     if (oldString !== undefined) args.oldString = oldString
     if (newString !== undefined) args.newString = newString
     return {
@@ -1076,6 +1205,7 @@ export function parseExecServerMessage(
     toolName,
     (msg[execVariant] as Record<string, unknown>) ?? {},
     execVariant,
+    dialect,
   )
   const rawArgs = (msg[execVariant] as Record<string, unknown>) ?? {}
   const resultMetadata = execVariant === "shell_stream_args" || execVariant === "shell_args"
@@ -1148,6 +1278,7 @@ export function mapCursorArgsToOpencode(
   toolName: string,
   raw: Record<string, unknown>,
   execVariant?: string,
+  dialect: HostToolDialect = OPENCODE_1_TOOL_DIALECT,
 ): { toolName: string; args: Record<string, unknown>; binaryBytes?: Uint8Array } {
   const cleaned: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(raw)) {
@@ -1162,7 +1293,7 @@ export function mapCursorArgsToOpencode(
   // Native ls_args → OpenCode read (directory listing via read).
   if (execVariant === "ls_args") {
     const filePath = str(cleaned.path) ?? str(cleaned.filePath)
-    return { toolName: "read", args: filePath ? { filePath } : {} }
+    return { toolName: "read", args: filePath ? { [dialect.filePathKey]: filePath } : {} }
   }
 
   // F11: Cursor native delete_args → OpenCode bash. No delete builtin exists, so
@@ -1171,7 +1302,7 @@ export function mapCursorArgsToOpencode(
   if (execVariant === "delete_args") {
     const target = str(cleaned.path) ?? str(cleaned.filePath)
     return {
-      toolName: "bash",
+      toolName: dialect.shellTool,
       args: target ? { command: `rm -f -- ${shellQuote(target)}` } : { command: "true" },
     }
   }
@@ -1180,7 +1311,7 @@ export function mapCursorArgsToOpencode(
     case "read": {
       const args: Record<string, unknown> = {}
       const filePath = str(cleaned.filePath) ?? str(cleaned.path) ?? str(cleaned.file_path)
-      if (filePath) args.filePath = filePath
+      assignHostFilePath(args, filePath, dialect)
       // Cursor often sends offset=0/limit=0 as protobuf defaults. OpenCode's
       // read treats limit=0 as "read zero lines" (empty content) — omit zeros.
       const offset = num(cleaned.offset)
@@ -1192,7 +1323,7 @@ export function mapCursorArgsToOpencode(
     case "write": {
       const args: Record<string, unknown> = {}
       const filePath = str(cleaned.filePath) ?? str(cleaned.path) ?? str(cleaned.file_path)
-      if (filePath) args.filePath = filePath
+      assignHostFilePath(args, filePath, dialect)
       // Cursor's LocalWriteExecutor prefers `file_bytes` whenever it is
       // non-empty and only falls back to `file_text`; mirror that order so a
       // byte-encoded write is not silently seen as empty content.
@@ -1222,7 +1353,7 @@ export function mapCursorArgsToOpencode(
       }
       const args: Record<string, unknown> = {}
       const filePath = str(cleaned.filePath) ?? str(cleaned.path) ?? str(cleaned.file_path)
-      if (filePath) args.filePath = filePath
+      assignHostFilePath(args, filePath, dialect)
       const oldString = stringValue(cleaned.oldString) ?? stringValue(cleaned.old_string)
       if (oldString !== undefined) args.oldString = oldString
       const newString = stringValue(cleaned.newString) ?? stringValue(cleaned.new_string)
@@ -1230,7 +1361,8 @@ export function mapCursorArgsToOpencode(
       if (typeof cleaned.replaceAll === "boolean") args.replaceAll = cleaned.replaceAll
       return { toolName: "edit", args }
     }
-    case "bash": {
+    case "bash":
+    case "shell": {
       const args: Record<string, unknown> = {}
       const command = str(cleaned.command)
       if (command) args.command = command
@@ -1238,7 +1370,7 @@ export function mapCursorArgsToOpencode(
       if (workdir) args.workdir = workdir
       const timeout = num(cleaned.timeout)
       if (timeout !== undefined) args.timeout = timeout
-      return { toolName: "bash", args }
+      return { toolName: dialect.shellTool, args }
     }
     case "grep": {
       const pattern = str(cleaned.pattern)
@@ -1367,7 +1499,8 @@ export function preferCorrelatedTaskDescription(
   parsed: ParsedExecRequest,
   description: string | undefined,
 ): void {
-  if (parsed.toolName !== "task" || parsed.resultField !== "subagent_result") return
+  if (parsed.toolName !== "task" && parsed.toolName !== "subagent") return
+  if (parsed.resultField !== "subagent_result") return
   const trimmed = description?.trim()
   if (!trimmed) return
   parsed.args.description = trimmed

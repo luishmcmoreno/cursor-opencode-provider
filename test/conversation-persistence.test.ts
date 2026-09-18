@@ -146,12 +146,16 @@ describe("conversation restart persistence", () => {
       conversationId,
       requestContext,
       toolCatalog,
+      hostAgent: "plan",
+      systemPromptHash: "stable-prompt-hash",
     })
 
     clearMemory()
     const hydrated = await hydrateConversationState(root, sessionKey)
     expect(hydrated?.conversationId).toBe(conversationId)
     expect(hydrated?.toolCatalog).toEqual(toolCatalog)
+    expect(hydrated?.hostAgent).toBe("plan")
+    expect(hydrated?.systemPromptHash).toBe("stable-prompt-hash")
     restoreTurnToolCatalog(sessionKey, hydrated!.toolCatalog)
     // A hydrated catalog is re-advertised on every lifecycle turn so the
     // RequestContext keeps its shape and the prompt cache survives; execution
@@ -174,6 +178,8 @@ describe("conversation restart persistence", () => {
     const session = turnEndedSession(root, checkpoint)
     restoreConversationBinding(session.openCodeSessionId!, session.conversationId)
     session.postCompactionRebase = true
+    session.hostAgent = "build"
+    session.stableSystemPromptHash = "build-prompt-hash"
     session.toolCatalog = [{ name: "bash", inputSchema: { type: "object" } }]
     const parts: unknown[] = []
     await pump(session, {
@@ -187,6 +193,8 @@ describe("conversation restart persistence", () => {
     expect(restored?.checkpoint).toEqual(checkpoint)
     expect(restored?.postCompactionRebase).toBe(true)
     expect(restored?.toolCatalog).toEqual(session.toolCatalog)
+    expect(restored?.hostAgent).toBe("build")
+    expect(restored?.systemPromptHash).toBe("build-prompt-hash")
     expect(parts.some((part: any) => part.type === "finish")).toBe(true)
   })
 

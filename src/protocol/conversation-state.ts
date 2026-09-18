@@ -28,6 +28,8 @@ export async function hydrateConversationState(
   conversationId: string
   postCompactionRebase: boolean
   toolCatalog: OpencodeToolDef[]
+  hostAgent?: string
+  systemPromptHash?: string
 } | undefined> {
   if (hasConversationBinding(sessionKey)) return undefined
   const loaded = await loadPersistedConversation(cacheDir, sessionKey)
@@ -53,6 +55,8 @@ export async function hydrateConversationState(
     conversationId: persisted.conversationId,
     postCompactionRebase: persisted.postCompactionRebase,
     toolCatalog: structuredClone(persisted.toolCatalog),
+    ...(persisted.hostAgent ? { hostAgent: persisted.hostAgent } : {}),
+    ...(persisted.systemPromptHash ? { systemPromptHash: persisted.systemPromptHash } : {}),
   }
 }
 
@@ -65,6 +69,8 @@ export async function persistConversationState(
     requestContext: Record<string, unknown>
     toolCatalog?: OpencodeToolDef[]
     postCompactionRebase?: boolean
+    hostAgent?: string
+    systemPromptHash?: string
   },
 ): Promise<void> {
   // A newer Run may have reset/superseded this conversation while its final
@@ -88,6 +94,8 @@ export async function persistConversationState(
     requestContext,
     toolCatalog: structuredClone(input.toolCatalog ?? []),
     postCompactionRebase: input.postCompactionRebase,
+    hostAgent: input.hostAgent,
+    systemPromptHash: input.systemPromptHash,
   })
   trace(
     `conversation persistence: saved sessionKey=${input.sessionKey} ` +

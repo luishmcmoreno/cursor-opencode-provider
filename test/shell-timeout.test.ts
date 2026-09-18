@@ -8,6 +8,7 @@ import {
   captureCursorShellResult,
   consumeCursorShellResult,
   cursorShellEnvForCall,
+  cursorShellEnvForCommand,
   prepareCursorShellArgs,
   registerCursorShellCall,
   releaseCursorShellEnv,
@@ -408,5 +409,45 @@ describe("Cursor shell timeout translation", () => {
     })
     expect(result.stdout.toString()).toContain("__CURSOR_BACKGROUND_SHELL__")
     releaseCursorShellEnv(id)
+  })
+})
+
+describe("cursorShellEnvForCommand", () => {
+  it("returns the pending wrap whose policy command matches", () => {
+    const id = "cursor_cmd_key"
+    registerCursorShellCall(id, {
+      background_shell_spawn: true,
+      command: "echo correlated",
+      working_directory: "/tmp",
+    })
+    const args = { command: "echo correlated" }
+    prepareCursorShellArgs(id, args)
+    const env = cursorShellEnvForCommand("echo correlated")
+    expect(env).toBeDefined()
+    expect(cursorShellEnvForCommand("echo other")).toBeUndefined()
+    releaseCursorShellEnv(id)
+  })
+
+  it("uses the working directory to disambiguate identical commands", () => {
+    const first = "cursor_cmd_first"
+    const second = "cursor_cmd_second"
+    registerCursorShellCall(first, {
+      background_shell_spawn: true,
+      command: "echo same",
+      working_directory: "/first",
+    })
+    registerCursorShellCall(second, {
+      background_shell_spawn: true,
+      command: "echo same",
+      working_directory: "/second",
+    })
+    prepareCursorShellArgs(first, { command: "echo same" })
+    prepareCursorShellArgs(second, { command: "echo same" })
+
+    expect(cursorShellEnvForCommand("echo same", "/second")).toBeDefined()
+    expect(cursorShellEnvForCall(second)).toBeUndefined()
+    expect(cursorShellEnvForCall(first)).toBeDefined()
+    releaseCursorShellEnv(first)
+    releaseCursorShellEnv(second)
   })
 })

@@ -34,6 +34,8 @@ import {
   buildReadMcpResourceFallback,
   CUSTOM_LIST_MCP_RESOURCES_TOOL,
   CUSTOM_READ_MCP_RESOURCE_TOOL,
+  hostToolDialectFromTools,
+  opencodePathArg,
 } from "../src/protocol/tools.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { encodeJsonAsValue } from "../src/protocol/struct.js"
@@ -249,7 +251,8 @@ describe("custom web tool aliases", () => {
       tool_name: "custom_websearch",
     })
     const nested = toolsToMcpDescriptors(catalog.advertisedTools, "opencode", ["brave-search"])
-    expect(nested[0]).toMatchObject({
+    expect(nested.find((descriptor) => descriptor.server_identifier === "brave-search"))
+      .toMatchObject({
       server_identifier: "brave-search",
       tools: [{ tool_name: "custom_websearch" }],
     })
@@ -351,19 +354,30 @@ describe("toolsToMcpDescriptors", () => {
       { name: "brave_web_search", description: "Search" },
       { name: "bash", description: "Shell" },
     ], "opencode", ["github", "brave"])
-    expect(d.map((x) => x.server_identifier)).toEqual(["opencode", "github", "brave"])
+    expect(d.map((x) => x.server_identifier)).toEqual(["opencode", "brave", "github"])
     expect(d[0].server_name).toBe("opencode")
     expect((d[0].tools as Array<{ tool_name: string }>).map((t) => t.tool_name)).toEqual([
-      "read",
       "bash",
+      "read",
     ])
     expect((d[1].tools as Array<{ tool_name: string }>).map((t) => t.tool_name)).toEqual([
+      "web_search",
+    ])
+    expect((d[2].tools as Array<{ tool_name: string }>).map((t) => t.tool_name)).toEqual([
       "create_pull_request",
       "get_me",
     ])
-    expect((d[2].tools as Array<{ tool_name: string }>).map((t) => t.tool_name)).toEqual([
-      "web_search",
-    ])
+  })
+
+  it("is byte-stable when the host enumerates the same catalog in a different order", () => {
+    const tools = [
+      { name: "read", description: "Read" },
+      { name: "github_get_me", description: "Who am I" },
+      { name: "brave_web_search", description: "Search" },
+      { name: "bash", description: "Shell" },
+    ]
+    expect(toolsToMcpDescriptors(tools, "opencode", ["github", "brave"]))
+      .toEqual(toolsToMcpDescriptors([...tools].reverse(), "opencode", ["brave", "github"]))
   })
 
   it("returns no descriptors for an empty tool list", () => {
@@ -528,6 +542,70 @@ describe("mapCursorArgsToOpencode", () => {
       args: {
         input: "[/tmp/lines-1200.txt#9D54]\nPUT 1.=1:\n+EDITED line 1200\nPUT 3.=3:\n+EDITED K1 line 1198",
       },
+    })
+  })
+})
+
+
+describe("OpenCode 2 host tool dialect", () => {
+  const oc2 = hostToolDialectFromTools([
+    { name: "read", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+    { name: "write", inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } } } },
+    { name: "edit", inputSchema: { type: "object", properties: { path: { type: "string" }, oldString: { type: "string" }, newString: { type: "string" } } } },
+    { name: "shell", inputSchema: { type: "object", properties: { command: { type: "string" } } } },
+  ])
+
+  it("detects path + shell from OpenCode 2.0 schemas", () => {
+    expect(oc2).toEqual({ filePathKey: "path", shellTool: "shell" })
+  })
+
+  it("emits path not filePath for read/write/edit", () => {
+    expect(mapCursorArgsToOpencode("read", { path: "/a.ts", offset: 10 }, undefined, oc2)).toEqual({
+      toolName: "read",
+      args: { path: "/a.ts", offset: 10 },
+    })
+    expect(mapCursorArgsToOpencode("write", { path: "/a.ts", file_text: "hi" }, undefined, oc2)).toEqual({
+      toolName: "write",
+      args: { path: "/a.ts", content: "hi" },
+    })
+    expect(mapCursorArgsToOpencode("edit", { filePath: "/a.ts", old_string: "a", new_string: "b" }, undefined, oc2)).toEqual({
+      toolName: "edit",
+      args: { path: "/a.ts", oldString: "a", newString: "b" },
+    })
+  })
+
+  it("maps bash to the advertised shell tool", () => {
+    expect(mapCursorArgsToOpencode("bash", { command: "ls" }, undefined, oc2)).toEqual({
+      toolName: "shell",
+      args: { command: "ls" },
+    })
+  })
+
+  it("forwards OpenCode execute Code Mode `{ code }` unchanged", () => {
+    expect(mapCursorArgsToOpencode("execute", { code: "return 1 + 1" })).toEqual({
+      toolName: "execute",
+      args: { code: "return 1 + 1" },
+    })
+    expect(mapCursorArgsToOpencode("execute", { code: "return 1 + 1" }, "mcp_args", oc2)).toEqual({
+      toolName: "execute",
+      args: { code: "return 1 + 1" },
+    })
+  })
+
+  it("parses read_args onto path for OpenCode 2", () => {
+    const result = parseExecServerMessage({
+      id: 1,
+      read_args: { path: "/test.txt", tool_call_id: "tc1" },
+    }, oc2)
+    expect(result!.args).toEqual({ path: "/test.txt" })
+    expect(result!.args.filePath).toBeUndefined()
+    expect(opencodePathArg(result!.args)).toBe("/test.txt")
+  })
+
+  it("falls back to path when only shell is advertised", () => {
+    expect(hostToolDialectFromTools([{ name: "shell" }])).toEqual({
+      filePathKey: "path",
+      shellTool: "shell",
     })
   })
 })
@@ -796,6 +874,50 @@ describe("parseExecServerMessage", () => {
       toolName: "task",
       args: { subagent_type: "scout" },
     })
+  })
+
+  it("extracts subagents from the OpenCode 2 subagent catalog", () => {
+    const catalog = extractHostSubagentCatalog([{
+      name: "subagent",
+      description: [
+        "Spawns an agent in a child session.",
+        "Available subagents: - explore: Fast agent specialized for exploring codebases. - general: General-purpose agent.",
+      ].join(" "),
+      inputSchema: { type: "object", properties: { agent: { type: "string" } } },
+    }])
+    expect(catalog.executor).toBe("subagent")
+    expect(catalog.complete).toBe(true)
+    expect(catalog.agents.map((agent) => agent.name)).toEqual(["explore", "general"])
+  })
+
+  it("remaps native Cursor Task onto OpenCode 2 subagent args", () => {
+    const parsed = parseExecServerMessage({
+      id: 37,
+      subagent_args: {
+        prompt: "Inspect the MCP import bridge",
+        subagent_type: "bugbot",
+        resume_agent_id: "ses_previous",
+        run_in_background: true,
+      },
+    })
+    remapNativeSubagentForCatalog(parsed!, ["subagent", "read"], {
+      executor: "subagent",
+      agents: [{ name: "general" }, { name: "explore" }],
+      complete: true,
+    })
+    expect(parsed).toMatchObject({
+      toolName: "subagent",
+      resultField: "subagent_result",
+      args: {
+        agent: "explore",
+        description: "Inspect the MCP import bridge",
+        prompt: "Inspect the MCP import bridge",
+        sessionID: "ses_previous",
+        background: true,
+      },
+    })
+    expect(parsed!.args.subagent_type).toBeUndefined()
+    expect(parsed!.args.task_id).toBeUndefined()
   })
 
   it("maps every canonical Pi exec request to its offset result field", () => {

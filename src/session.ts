@@ -4,6 +4,7 @@ import { CursorProtocolError, type CursorProviderError } from "./errors.js"
 import { sessionActivity, type SessionActivitySource } from "./activity.js"
 import type {
   HostSubagentCatalog,
+  HostToolDialect,
   OpencodeToolDef,
   ToolAliasRegistry,
 } from "./protocol/tools.js"
@@ -213,6 +214,10 @@ export type CursorSession = {
   }
   /** OpenCode session whose own or descendant activity renews tool leases. */
   openCodeSessionId?: string
+  /** Host primary agent whose prompt/permissions this Run was seeded with. */
+  hostAgent?: string
+  /** Stable host-system + provider-guidance identity for restart validation. */
+  stableSystemPromptHash?: string
   /** Completed compaction must rebase once before resuming a normal agent. */
   postCompactionRebase?: boolean
   /** Last real host catalog, retained only as a lifecycle-turn fallback. */
@@ -246,6 +251,8 @@ export type CursorSession = {
   toolDescriptors: Array<Record<string, unknown>>
   /** Cursor-facing web alias → exact executable host tool for this Run. */
   toolAliases?: ToolAliasRegistry
+  /** OpenCode 1.x `filePath`/`bash` vs 2.x `path`/`shell`, from advertised schemas. */
+  hostToolDialect?: HostToolDialect
   /** Spawnable host agents extracted from this turn's Task/Actor definition. */
   subagentCatalog?: HostSubagentCatalog
   /** Full RequestContext for exec #10 replies. */

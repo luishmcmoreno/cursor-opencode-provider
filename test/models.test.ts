@@ -4,6 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import {
   mapAvailableModelsResponse,
+  discoverModels,
   isCacheFresh,
   cacheFilePath,
   normalizeModelCache,
@@ -21,6 +22,7 @@ import {
   type ModelCache,
 } from "../src/models.js"
 import { modelInfoToConfig, modelsToConfig } from "../src/plugin.js"
+import { resetClientVersionCache } from "../src/protocol/client-version.js"
 
 const tempDirs: string[] = []
 
@@ -1136,5 +1138,94 @@ describe("model cache integrity", () => {
     const [firstModels, secondModels] = await Promise.all([first, second])
     expect(secondModels).toEqual(firstModels)
     expect((await readCache(directory))?.models).toEqual(firstModels)
+  })
+
+  it("runs an account refresh after an older in-flight cache write", async () => {
+    const directory = await tempDir()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const calls: string[] = []
+    const oldRefresh = refreshModelCache(directory, async () => {
+      calls.push("old")
+      await gate
+      return testCache("old-account").models
+    })
+    const accountRefresh = refreshModelCache(directory, async () => {
+      calls.push("new")
+      return testCache("new-account").models
+    }, { forceAfterInflight: true })
+
+    expect(calls).toEqual(["old"])
+    release()
+    await Promise.all([oldRefresh, accountRefresh])
+    expect(calls).toEqual(["old", "new"])
+    expect((await readCache(directory))?.models.map((model) => model.id)).toEqual([
+      "new-account",
+    ])
+  })
+
+  it("force-refreshes a fresh cache for a newly selected account", async () => {
+    const directory = await tempDir()
+    await writeCache(directory, testCache("old-account"))
+    let authorization: string | null = null
+    using server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        authorization = request.headers.get("authorization")
+        return Response.json({
+          models: [{
+            name: "new-account",
+            client_display_name: "New Account Model",
+            supports_agent: true,
+            variants: [],
+          }],
+        })
+      },
+    })
+    const previousVersion = process.env.CURSOR_CLIENT_VERSION
+    process.env.CURSOR_CLIENT_VERSION = "cli-test"
+    resetClientVersionCache()
+    try {
+      const models = await discoverModels("new-account-token", directory, {
+        baseURL: server.url.origin,
+        forceRefresh: true,
+      })
+      expect(authorization).toBe("Bearer new-account-token")
+      expect(models.map((model) => model.id)).toEqual(["new-account"])
+      expect((await readCache(directory))?.models.map((model) => model.id)).toEqual([
+        "new-account",
+      ])
+    } finally {
+      if (previousVersion === undefined) delete process.env.CURSOR_CLIENT_VERSION
+      else process.env.CURSOR_CLIENT_VERSION = previousVersion
+      resetClientVersionCache()
+    }
+  })
+
+  it("does not serve another account's cache when a forced refresh fails", async () => {
+    const directory = await tempDir()
+    await writeCache(directory, testCache("old-account"))
+    using server = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response("unauthorized", { status: 401 })
+      },
+    })
+    const previousVersion = process.env.CURSOR_CLIENT_VERSION
+    process.env.CURSOR_CLIENT_VERSION = "cli-test"
+    resetClientVersionCache()
+    try {
+      await expect(discoverModels("new-account-token", directory, {
+        baseURL: server.url.origin,
+        forceRefresh: true,
+      })).rejects.toThrow(/authentication failed/i)
+      expect((await readCache(directory))?.models.map((model) => model.id)).toEqual([
+        "old-account",
+      ])
+    } finally {
+      if (previousVersion === undefined) delete process.env.CURSOR_CLIENT_VERSION
+      else process.env.CURSOR_CLIENT_VERSION = previousVersion
+      resetClientVersionCache()
+    }
   })
 })

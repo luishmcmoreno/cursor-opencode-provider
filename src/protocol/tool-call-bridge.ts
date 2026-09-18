@@ -1,4 +1,8 @@
-import { mapCursorArgsToOpencode, mapCursorSubagentTypeToOpenCode, mcpRealToolName } from "./tools.js"
+import {
+  mapCursorArgsToOpencode,
+  mapCursorSubagentTypeToOpenCode,
+  mcpRealToolName,
+} from "./tools.js"
 import { decodeStructEntriesToJson } from "./struct.js"
 import { mapSwitchModeTarget } from "./switch-mode.js"
 

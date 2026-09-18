@@ -1,137 +1,141 @@
-import type { Plugin } from "@opencode-ai/plugin-next"
-import plugin from "../src/plugin-opencode2.js"
-
 /**
- * Compile-time guard for the hand-maintained OpenCode 2.0 types in
- * `src/opencode2/types.ts`. No runtime assertions; not part of the `bun test`
- * suite. Checked by `tsc -p tsconfig.test.json`, wired into `bun run typecheck`.
+ * Compile-time guard that this plugin's OpenCode 2.0 calls and payloads still
+ * fit the host contract in `opencode2-host-contract.ts`.
  *
- * `src/plugin-opencode2.ts` deliberately avoids importing `@opencode-ai/plugin`
- * at runtime: the 2.0 types live on the `@next` dist-tag and cannot coexist with
- * this package's `@opencode-ai/plugin@^1.17.13` dependency under the same
- * specifier. The aliased `@opencode-ai/plugin-next` devDependency exists purely
- * for this file.
+ * No runtime assertions; not part of `bun test`. Checked by
+ * `tsc -p tsconfig.test.json`, wired into `bun run typecheck`.
  *
- * These are deliberately *usage-level* assertions rather than whole-context
- * assignability. The host's types are Effect-schema derived (branded strings,
- * DeepMutable drafts); mirroring them exactly would churn on unrelated upstream
- * edits while protecting nothing. What matters is that the real API still
- * supports the exact calls the plugin makes — so each block below mirrors one
- * call site in `plugin-opencode2.ts`.
+ * Usage-level on purpose: the real host types are Effect-schema derived
+ * (branded strings, DeepMutable drafts). Whole-context equality would churn on
+ * unrelated host fields. Each block mirrors a call site in
+ * `src/plugin-opencode2.ts` / `src/opencode2/*`.
  */
 
-declare const ctx: Plugin.Context
+import plugin from "../src/plugin-opencode2.js"
+import {
+  applyCursorProviderInventory,
+  CURSOR_AISDK_PACKAGE,
+  modelsToCatalogModelMap,
+} from "../src/opencode2/catalog.js"
+import { applyCursorIntegration } from "../src/opencode2/integration.js"
+import { registerTodoTools } from "../src/opencode2/todo-tools.js"
+import type { HostModelInfo, HostPluginContext, HostProviderEditor, HostProviderInfo } from "./opencode2-host-contract.js"
 
-// ── The plugin object itself ──
+declare const ctx: HostPluginContext
+declare const editor: HostProviderEditor
+
 const _id: string = plugin.id
 void _id
-void (() => plugin.setup(ctx as any))
+void (() => plugin.setup(ctx))
 
-// ── aisdk: hooks are (name, callback), and the events carry what we read ──
+void (() =>
+  ctx.provider.transform((hostEditor) => {
+    applyCursorProviderInventory(hostEditor, [])
+  }))
+void (() => ctx.provider.reload())
+
+void (() => applyCursorProviderInventory(editor, []))
+
+const publishedInfo: HostProviderInfo = {
+  id: "cursor",
+  name: "Cursor",
+  activation: "enabled",
+  package: CURSOR_AISDK_PACKAGE,
+  integrationID: "cursor",
+}
+const publishedModels: readonly HostModelInfo[] = Object.values(
+  modelsToCatalogModelMap([
+    {
+      id: "claude-sonnet-4-5",
+      displayName: "Sonnet 4.5",
+      supportsAgent: true,
+      variants: [],
+    },
+  ]),
+)
+void editor.add({
+  info: publishedInfo,
+  models: publishedModels,
+  sourceConnection: { type: "env", name: "CURSOR_API_KEY" },
+})
+
 void (() =>
   ctx.aisdk.hook("sdk", (event) => {
-    const _pkg: string = event.package
-    const _provider: string = event.model.providerID
-    const _options: Record<string, any> = event.options
+    const pkg: string = event.package
+    const provider: string = event.model.providerID
+    const options: Record<string, any> = event.options
     event.sdk = {}
-    void [_pkg, _provider, _options]
+    void [pkg, provider, options]
   }))
 
 void (() =>
   ctx.aisdk.hook("language", (event) => {
-    // `modelID` is what we send on the wire; losing it would silently break
-    // long-context entries, which rely on it differing from `id`.
-    const _wire: string = event.model.modelID
-    const _id2: string = event.model.id
-    void [_wire, _id2, event.sdk]
+    const wire: string = event.model.modelID
+    const id: string = event.model.id
+    void [wire, id, event.sdk]
   }))
 
-// ── catalog: provider/model upsert via `update` ──
-void (() =>
-  ctx.catalog.transform((draft) => {
-    draft.provider.update("cursor" as any, (provider) => {
-      provider.name = "Cursor"
-      provider.package = "aisdk:cursor-opencode-provider"
-      provider.integrationID = "cursor" as any
-    })
-    draft.model.update("cursor" as any, "m" as any, (model) => {
-      model.modelID = "m" as any
-      model.name = "M"
-      model.enabled = true
-      model.status = "active"
-      model.limit = { context: 1, output: 1 }
-      model.capabilities = { tools: true, input: ["text"], output: ["text"] }
-      model.variants = []
-    })
-  }))
-void (() => ctx.catalog.reload())
-
-// ── integration: methods + connection lookup ──
-void (() =>
-  ctx.integration.transform((draft) => {
-    draft.update("cursor" as any, (integration) => {
-      integration.name = "Cursor"
-    })
-    draft.method.update({
-      integrationID: "cursor" as any,
-      method: { id: "oauth" as any, type: "oauth", label: "Cursor account" },
-      // Promise-valued in 2.0. This is the single biggest difference from the
-      // 1.18 `/v2/promise` API, where these are Effect-valued — if 2.0 ever
-      // moved back, this line is what catches it.
-      authorize: async () => ({
-        url: "https://example.invalid",
-        instructions: "",
-        mode: "auto" as const,
-        callback: Promise.resolve({
-          type: "oauth" as const,
-          methodID: "oauth" as any,
-          access: "a",
-          refresh: "r",
-          expires: 0,
-        }),
-      }),
-      refresh: async (credential) => credential,
-    })
-    draft.method.update({ integrationID: "cursor" as any, method: { type: "key" } })
-    draft.method.update({
-      integrationID: "cursor" as any,
-      method: { type: "env", names: ["CURSOR_API_KEY"] },
-    })
-  }))
+void (() => ctx.integration.transform(applyCursorIntegration))
+void (() => ctx.tool.transform((hostEditor) => registerTodoTools(hostEditor)))
 
 void (async () => {
-  const connection = await ctx.integration.connection.active("cursor" as any)
+  const connection = await ctx.integration.connection.active("cursor")
   if (connection) await ctx.integration.connection.resolve(connection)
 })
 
-// ── tool: registration + execute hooks (our shell-timeout wrapper) ──
 void (() =>
   ctx.tool.hook("execute.before", (event) => {
-    const _tool: string = event.tool
-    const _id: string = event.id
-    // We rewrite the bash command here because 2.0 has no `shell.env`.
+    const tool: string = event.tool
+    const id: string = event.id ?? event.callID
     event.input = {}
-    void [_tool, _id]
+    void [tool, id]
   }))
 
 void (() =>
   ctx.tool.hook("execute.after", (event) => {
-    const _id: string = event.id
+    const id: string = event.id ?? event.callID
     if (event.status === "completed") void event.result
-    void _id
+    void id
   }))
 
-// ── session: the only place the owning agent is named (compaction marker),
-// and `get` is how we resolve a session's actual project directory ──
 void (() =>
   ctx.session.hook("context", (event) => {
-    const _sessionID: string = event.sessionID
-    const _agent: string = event.agent
-    void [_sessionID, _agent]
+    const sessionID: string = event.sessionID
+    const agent: string = event.agent
+    event.options = { ...(event.options ?? {}), flagged: true }
+    void [sessionID, agent]
   }))
 
+void (() =>
+  ctx.session.hook("compaction", (event) => {
+    event.options = { ...(event.options ?? {}), compact: true }
+    void event.sessionID
+  }))
+
+void (() => ctx.session.hook("generate", (event) => void event.sessionID))
+void (() => ctx.session.hook("title", (event) => void event.sessionID))
+
 void (async () => {
-  const info = await ctx.session.get({ sessionID: "s" as any })
-  const _directory: string = info.location.directory
-  void _directory
+  const info = await ctx.session.get({ sessionID: "s" })
+  const directory: string = info.location.directory
+  const loc: string = ctx.location.directory
+  await ctx.session.switchAgent({ sessionID: "s", agent: "build" })
+  await ctx.session.synthetic({ sessionID: "s", text: "go" })
+  await ctx.session.prompt({ sessionID: "s", text: "go" })
+  void [directory, loc]
 })
+
+void (() =>
+  ctx.shell.hook("create.before", (event) => {
+    event.env = { ...event.env, CURSOR: "1" }
+    void event.command
+  }))
+
+void (() =>
+  ctx.websearch.transform((editor) => {
+    editor.add({
+      id: "cursor-exa",
+      name: "Exa",
+      execute: async () => [],
+    })
+  }))

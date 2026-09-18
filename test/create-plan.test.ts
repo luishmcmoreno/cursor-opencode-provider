@@ -31,6 +31,7 @@ import {
   type OpenCodePathBridge,
 } from "../src/context/paths.js"
 import {
+  cancelPlanExecutionKickoff,
   createPlanExecutionKickoffText,
   formatPlanKickoffPath,
   flushPlanExecutionKickoff,
@@ -641,6 +642,36 @@ describe("plan execution kickoff helpers", () => {
     expect(attempts).toBe(2)
     expect(planExecutionKickoffState("retry-session")).toBeUndefined()
   })
+
+  it("discards a kickoff whose owning Run was superseded", async () => {
+    const calls: string[] = []
+    setPlanExecutionKickoff(async input => { calls.push(input.planPath) })
+    expect(queuePlanExecutionKickoff({
+      sessionID: "stale-session",
+      planPath: "/tmp/stale.md",
+      cursorSessionID: "cursor-old",
+    })).toBe(true)
+
+    expect(await flushPlanExecutionKickoff("stale-session", {
+      cursorSessionID: "cursor-new",
+      terminal: true,
+    })).toBe(false)
+    expect(planExecutionKickoffState("stale-session")).toBeUndefined()
+    expect(calls).toEqual([])
+  })
+
+  it("clears a deleted session's pending kickoff and warning", async () => {
+    setPlanExecutionKickoff(async () => { throw new Error("not available") })
+    queuePlanExecutionKickoff({
+      sessionID: "deleted-session",
+      planPath: "/tmp/deleted.md",
+    })
+    await flushPlanExecutionKickoff("deleted-session", { terminal: true })
+    cancelPlanExecutionKickoff("deleted-session")
+
+    expect(planExecutionKickoffState("deleted-session")).toBeUndefined()
+    expect(takePlanExecutionKickoffWarning("deleted-session")).toBeUndefined()
+  })
 })
 
 describe("CreatePlan execution approval over a held-open Run", () => {
@@ -781,8 +812,8 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     const { session, writes, parts } = await startPlan()
     const toolCall = parts.find((part: any) => part.type === "tool-call")
     const question = JSON.parse(toolCall.input).questions[0].question as string
-    // No handler models OpenCode 2.0, whose public SessionDomain cannot select
-    // the build agent for a faithful plan_exit-shaped prompt.
+    // Model a host/plugin surface that has no safe way to start an execution
+    // turn after approval.
     setPlanExecutionKickoff(undefined)
 
     deliverContinuationResults(session, [{

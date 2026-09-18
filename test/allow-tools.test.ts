@@ -189,6 +189,41 @@ describe("compaction tool catalog", () => {
       .toEqual({ reset: false })
   })
 
+  it("rebases checkpoints when the host agent or stable system prompt changes", () => {
+    const sessionKey = "ses_prompt_identity"
+    expect(resolveTurnConversationReset({
+      sessionKey,
+      isCompaction: false,
+      promptIdentity: { hostAgent: "build", systemPromptHash: "prompt-a" },
+    })).toEqual({ reset: false })
+    // Title/generate lifecycle calls deliberately omit promptIdentity. Their
+    // reduced or rewritten prompt must not replace the primary cache identity.
+    expect(resolveTurnConversationReset({
+      sessionKey,
+      isCompaction: false,
+    })).toEqual({ reset: false })
+    expect(resolveTurnConversationReset({
+      sessionKey,
+      isCompaction: false,
+      promptIdentity: { hostAgent: "build", systemPromptHash: "prompt-a" },
+    })).toEqual({ reset: false })
+    expect(resolveTurnConversationReset({
+      sessionKey,
+      isCompaction: false,
+      promptIdentity: { hostAgent: "build", systemPromptHash: "prompt-a" },
+    })).toEqual({ reset: false })
+    expect(resolveTurnConversationReset({
+      sessionKey,
+      isCompaction: false,
+      promptIdentity: { hostAgent: "plan", systemPromptHash: "prompt-a" },
+    })).toEqual({ reset: true, reason: "agent-change" })
+    expect(resolveTurnConversationReset({
+      sessionKey,
+      isCompaction: false,
+      promptIdentity: { hostAgent: "plan", systemPromptHash: "prompt-b" },
+    })).toEqual({ reset: true, reason: "system-prompt-change" })
+  })
+
   it("bounds cached tool catalogs and pending post-compaction rebases", async () => {
     await resolveTurnToolState({
       sessionKey: "oldest",

@@ -43,7 +43,10 @@ const SOURCE_FILES = filesUnder("src", [".ts", ".d.ts"])
 const TEST_FILES = filesUnder("test", [".ts"])
   .filter(file => path.basename(file) !== "architecture.test.ts")
 const PACKAGE_FILES = ["package.json", "bun.lock"].map(name => path.join(ROOT, name))
-const DIST_FILES = filesUnder("dist", [".js", ".d.ts"])
+// `package.json#files` publishes the whole directory, not only compiler output.
+// Include metadata so a stale host-specific build artifact cannot cross the
+// provider / compatibility-layer boundary unnoticed.
+const DIST_FILES = filesUnder("dist", [".js", ".d.ts", ".json"])
 
 describe("provider / compatibility-layer architecture", () => {
   test("provider package and executable surfaces never depend on compatibility packages", () => {
@@ -80,6 +83,29 @@ describe("provider / compatibility-layer architecture", () => {
     expect(found).toEqual([])
   })
 
+  test("OpenCode 2.0 plugin does not depend on the host SDK package", () => {
+    const found = violations(
+      [...SOURCE_FILES, ...DIST_FILES],
+      /^\s*import[^\n]*["']@opencode\/plugin(?:\/[^"']*)?["']/,
+    )
+    expect(found).toEqual([])
+    const pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
+      dependencies?: Record<string, string>
+      devDependencies?: Record<string, string>
+      peerDependencies?: Record<string, string>
+      optionalDependencies?: Record<string, string>
+      scripts?: Record<string, string>
+    }
+    const deps = {
+      ...pkg.dependencies,
+      ...pkg.devDependencies,
+      ...pkg.peerDependencies,
+      ...pkg.optionalDependencies,
+    }
+    expect(deps["@opencode/plugin"]).toBeUndefined()
+    expect(pkg.scripts?.typecheck).toContain("tsconfig.test.json")
+  })
+
   test("built output preserves the boundary after build", () => {
     if (DIST_FILES.length === 0) return
     expect(violations(
@@ -87,7 +113,7 @@ describe("provider / compatibility-layer architecture", () => {
       /@opencode-compat\/|MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\boh-my-pi\b|\bOMP\b/,
     )).toEqual([])
     expect(violations(
-      DIST_FILES.filter(file => /(?:plugin(?:-v2)?|web-search-tool|image-save-tool)\.js$/.test(file)),
+      DIST_FILES.filter(file => /(?:plugin(?:-v2|-opencode2)?|web-search-tool|image-save-tool)\.js$/.test(file)),
       /^\s*import[^\n]*["']@opencode-ai\/plugin(?:\/[^"']*)?["']/,
     )).toEqual([])
   })

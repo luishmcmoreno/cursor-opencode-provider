@@ -71,6 +71,100 @@ export function parseOpenCodeWebSearchResponse(raw: string): string | undefined 
  * OpenCode 2.0 plugin's tool registration share one implementation — 2.0's
  * ToolContext has no `ask`, permissions being handled by the host instead.
  */
+
+export type OpenCode2WebSearchResult = {
+  url: string
+  title?: string
+  content?: string
+  time: { published?: number }
+}
+
+function tryParseJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+}
+
+function publishedMs(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 1e12 ? Math.floor(value * 1000) : Math.floor(value)
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Date.parse(value)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  return undefined
+}
+
+function asWebSearchResult(row: unknown): OpenCode2WebSearchResult | undefined {
+  if (!row || typeof row !== "object") return undefined
+  const record = row as Record<string, unknown>
+  const url =
+    typeof record.url === "string" ? record.url
+    : typeof record.href === "string" ? record.href
+    : undefined
+  if (!url) return undefined
+  const title = typeof record.title === "string" ? record.title : undefined
+  const content =
+    typeof record.content === "string" ? record.content
+    : typeof record.text === "string" ? record.text
+    : typeof record.snippet === "string" ? record.snippet
+    : undefined
+  const published = publishedMs(record.publishedDate ?? record.published ?? record.date)
+  return {
+    url,
+    ...(title ? { title } : {}),
+    ...(content ? { content } : {}),
+    time: published !== undefined ? { published } : {},
+  }
+}
+
+function parseExaTextResults(text: string): OpenCode2WebSearchResult[] {
+  return text.split(/\n\n---\n\n/).flatMap((block) => {
+    const url = block.match(/^URL:\s*(.+)$/m)?.[1]?.trim()
+    if (!url) return []
+    const title = block.match(/^Title:\s*(.+)$/m)?.[1]?.trim()
+    const publishedText = block.match(/^Published:\s*(.+)$/m)?.[1]?.trim()
+    const published = publishedText && publishedText !== "N/A"
+      ? publishedMs(publishedText)
+      : undefined
+    const content = block.match(/^(?:Highlights|Text):\s*\n?([\s\S]*)$/m)?.[1]?.trim()
+    return [{
+      url,
+      ...(title && title !== "N/A" ? { title } : {}),
+      ...(content ? { content } : {}),
+      time: published === undefined ? {} : { published },
+    }]
+  })
+}
+
+/**
+ * Turn an Exa MCP text blob into OpenCode 2.0 `websearch` results
+ * (`{ url, title?, content?, time }`). Unknown shapes yield an empty list.
+ */
+export function parseExaWebSearchResults(raw: string): OpenCode2WebSearchResult[] {
+  const text = parseOpenCodeWebSearchResponse(raw) ?? raw.trim()
+  if (!text) return []
+  const parsed = tryParseJson(text)
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object"
+      ? Array.isArray((parsed as { results?: unknown }).results)
+        ? (parsed as { results: unknown[] }).results
+        : Array.isArray((parsed as { data?: unknown }).data)
+          ? (parsed as { data: unknown[] }).data
+          : []
+      : []
+  if (rows.length > 0) {
+    return rows.flatMap((row) => {
+      const result = asWebSearchResult(row)
+      return result ? [result] : []
+    })
+  }
+  return parseExaTextResults(text)
+}
 export async function fetchOpenCodeWebSearchText(
   args: OpenCodeWebSearchArgs,
   signal: AbortSignal | undefined,
@@ -141,4 +235,3 @@ export async function executeOpenCodeWebSearch(
     metadata: { provider: "exa" },
   }
 }
-

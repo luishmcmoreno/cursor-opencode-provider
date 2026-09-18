@@ -107,6 +107,9 @@ Also inspect the outbound flags:
   checkpoint.
 - `compaction=true` and the subsequent `post-compaction-rebase` intentionally
   rotate Cursor conversation ids.
+- `agent-change` and `system-prompt-change` intentionally rotate once so an
+  opaque checkpoint cannot suppress the newly selected OpenCode agent or
+  vendor prompt. Title/generation lifecycle prompts do not trigger these.
 
 At provider startup, `conversation persistence: restored` confirms that the
 session binding, checkpoint, reachable blobs, and frozen context were hydrated.

@@ -346,6 +346,31 @@ export function cursorShellEnvForCall(toolCallId: string | undefined): Record<st
   return wrap.env
 }
 
+/**
+ * OpenCode 2.0 `shell.create.before` has no tool-call id. Correlate the pending
+ * wrap by command + working directory when possible, then fall back to the
+ * original command for hosts that omit the directory.
+ */
+export function cursorShellEnvForCommand(
+  command: string | undefined,
+  workingDirectory?: string,
+): Record<string, string> | undefined {
+  if (typeof command !== "string" || !command) return undefined
+  if (workingDirectory) {
+    for (const [id, policy] of policies) {
+      if (!pendingEnvWraps.has(id)) continue
+      if (policy.command === command && policy.workingDirectory === workingDirectory) {
+        return cursorShellEnvForCall(id)
+      }
+    }
+  }
+  for (const [id, policy] of policies) {
+    if (!pendingEnvWraps.has(id)) continue
+    if (policy.command === command) return cursorShellEnvForCall(id)
+  }
+  return undefined
+}
+
 function withoutMarker(output: string, index: number): string {
   let clean = output.slice(0, index).replace(/[\t ]+$/gm, "").replace(/\n{2,}$/, "\n")
   if (clean.trim() === "" || clean.trim() === "(no output)") clean = ""
@@ -475,11 +500,16 @@ function parseBackgroundSpawnOutcome(
 /**
  * Strip private wrapper sentinels / OpenCode timeout envelopes for display.
  * Does not record outcomes — use {@link captureCursorShellResult} for that.
+ *
+ * OpenCode 2.0 `Tool.Result.output` is structured (an object for shell), not
+ * a string. Non-string input is returned unchanged so the 2.0 after-hook can
+ * pass structured output through safely.
  */
 export function sanitizeCursorShellDisplayOutput(
   output: string,
   policy?: CursorShellPolicy,
 ): string {
+  if (typeof output !== "string") return output
   if (policy?.backgroundSpawn) {
     const spawn = parseBackgroundSpawnOutcome(output, policy)
     if (spawn) return formatShellOutcomeDisplay(spawn.output, spawn.outcome)
@@ -500,6 +530,7 @@ export function sanitizeCursorShellDisplayOutput(
 
 /** Sanitize a secondary display string (e.g. Bash `metadata.output`) for a registered call. */
 export function sanitizeRegisteredCursorShellOutput(toolCallId: string, output: string): string {
+  if (typeof output !== "string") return output
   if (typeof toolCallId !== "string" || !toolCallId) return output
   return sanitizeCursorShellDisplayOutput(output, policies.get(toolCallId))
 }
@@ -507,12 +538,16 @@ export function sanitizeRegisteredCursorShellOutput(toolCallId: string, output: 
 /**
  * Capture Bash completion in the classic plugin's after hook. Returns the
  * sanitized output that OpenCode should store and render.
+ *
+ * Guards non-string output (OpenCode 2.0 structured `Tool.Result.output`)
+ * by returning it unchanged.
  */
 export function captureCursorShellResult(
   toolCallId: string,
   output: string,
   metadata?: Record<string, unknown>,
 ): string {
+  if (typeof output !== "string") return output
   if (typeof toolCallId !== "string" || !toolCallId.startsWith("cursor_")) return output
   const policy = policies.get(toolCallId)
   if (policy?.backgroundSpawn) {

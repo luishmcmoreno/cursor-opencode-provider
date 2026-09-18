@@ -42,6 +42,8 @@ import {
   CUSTOM_WEBSEARCH_TOOL,
   CUSTOM_LIST_MCP_RESOURCES_TOOL,
   CUSTOM_READ_MCP_RESOURCE_TOOL,
+  hostToolDialectFromTools,
+  opencodePathArg,
   type OpencodeToolDef,
   type ParsedExecRequest,
 } from "./protocol/tools.js"
@@ -104,6 +106,10 @@ import {
   takePlanExecutionKickoffWarning,
 } from "./plan-execution-kickoff.js"
 import {
+  flushHostAgentModeSwitch,
+  queueHostAgentModeSwitch,
+} from "./host-agent-mode.js"
+import {
   CURSOR_IMAGE_SAVE_TOOL,
   imageMimeForPath,
   remapCursorImageWritePath,
@@ -162,7 +168,11 @@ import {
   setHostCacheDirOverride,
 } from "./context/paths.js"
 import { resolveAgentUrl } from "./agent-url.js"
-import { CURSOR_API_HOST, CURSOR_COMPACTION_OPTION } from "./shared.js"
+import {
+  CURSOR_API_HOST,
+  CURSOR_COMPACTION_OPTION,
+  CURSOR_HOST_AGENT_OPTION,
+} from "./shared.js"
 import { isCompactionSession } from "./compaction-marker.js"
 import { getSessionDirectory } from "./session-directory.js"
 import type { SeedHistoryMessage } from "./protocol/request.js"
@@ -201,6 +211,8 @@ const sentHistoryImageHashesBySession = new Map<string, Set<string>>()
 // suppresses OpenCode's compacted prompt/system seed and makes Cursor narrate
 // tool use instead of emitting exec requests. Rebase once on the next turn.
 const postCompactionRebaseBySession = new Set<string>()
+type PromptIdentity = { hostAgent?: string; systemPromptHash?: string }
+const promptIdentityBySession = new Map<string, PromptIdentity>()
 export const MAX_TURN_STATE_SESSIONS = 256
 const MAX_SENT_HISTORY_IMAGES_PER_SESSION = 256
 const DEFAULT_RETRY_POLICY = {
@@ -559,6 +571,40 @@ function rememberPostCompactionRebase(sessionKey: string): void {
   }
 }
 
+function normalizePromptIdentity(value: PromptIdentity): PromptIdentity {
+  const hostAgent = value.hostAgent?.trim()
+  const systemPromptHash = value.systemPromptHash?.trim()
+  return {
+    ...(hostAgent ? { hostAgent } : {}),
+    ...(systemPromptHash ? { systemPromptHash } : {}),
+  }
+}
+
+function rememberPromptIdentity(sessionKey: string, value: PromptIdentity): void {
+  const normalized = normalizePromptIdentity(value)
+  if (!normalized.hostAgent && !normalized.systemPromptHash) return
+  promptIdentityBySession.delete(sessionKey)
+  promptIdentityBySession.set(sessionKey, normalized)
+  while (promptIdentityBySession.size > MAX_TURN_STATE_SESSIONS) {
+    const oldest = promptIdentityBySession.keys().next().value as string | undefined
+    if (!oldest) break
+    promptIdentityBySession.delete(oldest)
+  }
+}
+
+function promptIdentityChanged(previous: PromptIdentity, current: PromptIdentity): boolean {
+  // Compare only facts the current host supplied. This keeps standalone calls
+  // and older compatibility surfaces from invalidating a valid checkpoint just
+  // because they cannot expose an agent id.
+  return (
+    (current.hostAgent !== undefined && previous.hostAgent !== current.hostAgent)
+    || (
+      current.systemPromptHash !== undefined
+      && previous.systemPromptHash !== current.systemPromptHash
+    )
+  )
+}
+
 function sentHistoryImageHashes(sessionKey: string | undefined): ReadonlySet<string> | undefined {
   if (!sessionKey) return undefined
   const hashes = sentHistoryImageHashesBySession.get(sessionKey)
@@ -736,6 +782,12 @@ async function doStreamImpl(
               setActiveCursorMode(activeSession.openCodeSessionId, "plan")
             }
           }
+          await flushHostAgentModeSwitch(activeSession.openCodeSessionId, {
+            cursorSessionID: activeSession.sessionId,
+            terminal: activeSession.closed,
+            pumpActive: activeSession.pumpActive || activeSession.pumpOwner != null,
+            pendingExecs: activeSession.pending.size,
+          })
         } catch (e) {
           activeSession.pumpActive = false
           trace(`pull: pump threw (cleaning up): ${(e as Error).message}`)
@@ -920,14 +972,27 @@ async function startSession(
     })
     if (restored?.postCompactionRebase) rememberPostCompactionRebase(sessionKey)
     if (restored?.toolCatalog.length) restoreTurnToolCatalog(sessionKey, restored.toolCatalog)
+    if (restored?.hostAgent || restored?.systemPromptHash) {
+      rememberPromptIdentity(sessionKey, {
+        ...(restored.hostAgent ? { hostAgent: restored.hostAgent } : {}),
+        ...(restored.systemPromptHash ? { systemPromptHash: restored.systemPromptHash } : {}),
+      })
+    }
   }
   const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
+  const hostAgent = typeof providerOptions?.[CURSOR_HOST_AGENT_OPTION] === "string"
+    ? String(providerOptions[CURSOR_HOST_AGENT_OPTION]).trim() || undefined
+    : undefined
   // The classic plugin marks OpenCode's agent="compaction" through chat.params.
-  // OpenCode 2.0 removed that hook, so its plugin records the same fact against
-  // the session id from session.hook("context") instead; consult both.
+  // OpenCode 2.0 removed that hook, so its plugin writes the same request-local
+  // option from session hooks. The session marker is a fallback only when a
+  // host does not preserve mutable options; explicit false prevents concurrent
+  // title/generate calls from inheriting a compaction marker.
   // Do not infer this from tools/toolChoice: standalone no-tool calls are valid.
-  const isCompaction =
-    providerOptions?.[CURSOR_COMPACTION_OPTION] === true || isCompactionSession(sessionKey)
+  const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
+  const isCompaction = compactionOption === true || (
+    compactionOption === undefined && isCompactionSession(sessionKey)
+  )
   const toolState = await resolveTurnToolState({
     sessionKey,
     incomingTools,
@@ -946,14 +1011,33 @@ async function startSession(
   }
   const allowTools = toolState.allowTools
   const discoveredSubagentCatalog = extractHostSubagentCatalog(cursorTools)
-  const resetState = resolveTurnConversationReset({ sessionKey, isCompaction })
   let recovery = startOptions?.recovery
   let resumeRecovery = recovery?.kind === "resume" ? recovery : undefined
   let resuming = !!resumeRecovery
+  const lifecycle = !allowTools && !isCompaction && !recovery
+  // v1 sets `options.workspaceRoot` correctly per invocation (`input.directory`,
+  // one plugin instance per project). OpenCode 2.0 runs one daemon across many
+  // projects, so its static option is only a fallback for the directory recorded
+  // from `session.hook("context")`.
+  const workspaceRoot = path.resolve(
+    getSessionDirectory(sessionKey) ?? (options.workspaceRoot || process.cwd()),
+  )
+  const baseSystemPrompt = extractSystemPrompt(prompt)
+  const interactionGuidance = buildOpenCodeInteractionGuidance(cursorTools, isCompaction, workspaceRoot)
+  const stableSystemPrompt = [baseSystemPrompt, interactionGuidance].filter(Boolean).join("\n\n")
+  const stableSystemPromptHash = stableSystemPrompt
+    ? createHash("sha256").update(stableSystemPrompt).digest("hex")
+    : undefined
+  const resetState = resolveTurnConversationReset({
+    sessionKey,
+    isCompaction,
+    ...(lifecycle
+      ? {}
+      : { promptIdentity: { hostAgent, systemPromptHash: stableSystemPromptHash } }),
+  })
   // Compaction must not reuse the prior conversation; its first normal turn
   // must also rebase so the summary-agent checkpoint cannot replace the normal
   // system prompt and OpenCode's newly compacted history.
-  const lifecycle = !allowTools && !isCompaction && !recovery
   let bound = resuming
     ? { conversationId: resumeRecovery!.conversationId, reset: false, previousId: undefined }
     : bindConversationId(sessionKey, {
@@ -1013,20 +1097,13 @@ async function startSession(
   const userText = recovery?.kind === "rebase"
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (extractUserText(lastUser) || ".")
-  // v1 sets `options.workspaceRoot` correctly per invocation (`input.directory`,
-  // one plugin instance per project). OpenCode 2.0 runs one daemon across many
-  // projects, so its static `options.workspaceRoot` is only a last-resort
-  // fallback; `getSessionDirectory` carries the real per-session directory
-  // recorded from `session.hook("context")` in `plugin-opencode2.ts`.
-  const workspaceRoot = path.resolve(
-    getSessionDirectory(sessionKey) ?? (options.workspaceRoot || process.cwd()),
-  )
-  const baseSystemPrompt = extractSystemPrompt(prompt)
-  const interactionGuidance = buildOpenCodeInteractionGuidance(cursorTools, isCompaction, workspaceRoot)
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
   const startedWithCheckpoint = !!conversationState
-  const modeReminder = isCompaction || startedWithCheckpoint || lifecycle
+  const activeMode = getActiveCursorMode(sessionKey)
+  const nativePlanPromptOwnsMode = hostAgent === "plan"
+    && (activeMode === "plan" || activeMode === "spec")
+  const modeReminder = isCompaction || startedWithCheckpoint || lifecycle || nativePlanPromptOwnsMode
     ? undefined
     : takeActiveCursorModeReminder(sessionKey, {
         advertisedTools: cursorTools.map((tool) => tool.name),
@@ -1239,6 +1316,12 @@ async function startSession(
     throw error
   }
 
+  const hostToolDialect = hostToolDialectFromTools(tools)
+  trace(
+    `host tool dialect: filePathKey=${hostToolDialect.filePathKey} shellTool=${hostToolDialect.shellTool} ` +
+      `tools=[${tools.map((t) => t.name).join(",")}]`,
+  )
+
   const session: CursorSession = {
     sessionId: crypto.randomUUID(),
     conversationId,
@@ -1265,6 +1348,8 @@ async function startSession(
       execRequests: 0,
     },
     openCodeSessionId: lifecycle ? undefined : sessionKey,
+    hostAgent,
+    stableSystemPromptHash,
     postCompactionRebase: isCompaction,
     toolCatalog: snapshotToolCatalog(sessionKey),
     stream,
@@ -1280,6 +1365,7 @@ async function startSession(
     blobs: new Map(),
     toolDescriptors,
     toolAliases: webToolAliases.aliases,
+    hostToolDialect,
     subagentCatalog,
     requestContext,
     allowTools,
@@ -1498,8 +1584,11 @@ function buildCreatePlanContinuationFrame(
 function buildSwitchModeContinuationFrame(
   pending: PendingExec,
   result: ExtractedToolResult,
-  sessionKey: string | undefined,
-): Uint8Array {
+): {
+  frame: Uint8Array
+  approvedTarget?: string
+  bridgeKind?: unknown
+} {
   const metadata = pending.resultMetadata ?? {}
   const interactionId = metadata.interactionId
   if (typeof interactionId !== "number") {
@@ -1511,16 +1600,13 @@ function buildSwitchModeContinuationFrame(
   const answer = metadata.switchModeBridgeKind === "question"
     ? switchModeResultFromQuestionOutput(result.output, result.error !== undefined)
     : switchModeResultFromToolOutput(result.output, result.error !== undefined)
-  if ("approved" in answer) {
-    const target = metadata.switchModeTarget
-    if (typeof target === "string" && target.trim()) {
-      const normalized = target.trim().toLowerCase()
-      setActiveCursorMode(sessionKey, target, {
-        bridgedPlanEntered: normalized === "plan" || normalized === "spec",
-      })
-    }
+  const target = "approved" in answer && typeof metadata.switchModeTarget === "string"
+    ? metadata.switchModeTarget.trim()
+    : ""
+  return {
+    frame: buildSwitchModeInteractionReply(interactionId, answer),
+    ...(target ? { approvedTarget: target, bridgeKind: metadata.switchModeBridgeKind } : {}),
   }
-  return buildSwitchModeInteractionReply(interactionId, answer)
 }
 
 /**
@@ -1556,6 +1642,7 @@ export function deliverContinuationResults(
     }
     const pending = claim.pending
     let frames: Uint8Array[] = []
+    let deliveredSwitchMode: { target: string; bridgeKind?: unknown } | undefined
     if (pending.resultField === ASK_QUESTION_RESULT_FIELD) {
       // A bridged Cursor AskQuestion. The host tool result carries the user's
       // choices; translate them back into the Cursor result the interaction is
@@ -1573,7 +1660,14 @@ export function deliverContinuationResults(
       // approved{} or rejected{reason} on the still-open InteractionQuery.
       // Approval also arms the CLI-shaped mode reminder for the next Run.
       try {
-        frames = [buildSwitchModeContinuationFrame(pending, r, session.openCodeSessionId)]
+        const built = buildSwitchModeContinuationFrame(pending, r)
+        frames = [built.frame]
+        if (built.approvedTarget) {
+          deliveredSwitchMode = {
+            target: built.approvedTarget,
+            bridgeKind: built.bridgeKind,
+          }
+        }
       } catch (error) {
         trace(`continuation: switch_mode encode FAILED execId=${r.execId} err=${(error as Error).message}`)
         sessionManager.close(session, "result-write-failed")
@@ -1700,6 +1794,22 @@ export function deliverContinuationResults(
       trace(`continuation: delivery stopped execId=${r.execId} reason=${outcome.reason}`)
       if (outcome.kind === "duplicate") continue
       return undefined
+    }
+    if (deliveredSwitchMode) {
+      const normalized = deliveredSwitchMode.target.toLowerCase()
+      setActiveCursorMode(session.openCodeSessionId, deliveredSwitchMode.target, {
+        bridgedPlanEntered: normalized === "plan" || normalized === "spec",
+      })
+      // A question-emulated exit has no native host plan tool to perform the
+      // actual primary-agent switch. Queue only after Cursor received the
+      // approved response; a failed write must not mutate host mode.
+      if (deliveredSwitchMode.bridgeKind === "question" && session.openCodeSessionId) {
+        queueHostAgentModeSwitch({
+          sessionID: session.openCodeSessionId,
+          targetModeID: deliveredSwitchMode.target,
+          cursorSessionID: session.sessionId,
+        })
+      }
     }
     // A host `todoread` result is the authoritative list. Refresh the mirrored
     // snapshot (direct reads and bridged native reads alike) so later merges
@@ -2034,7 +2144,7 @@ export async function pump(
     const display = parseDisplayToolCall(displayCallId, stored)
     if (display?.variant !== "edit_tool_call" || display.bridgeable === false) return false
 
-    const requestedPath = typeof parsed.args.filePath === "string" ? parsed.args.filePath : ""
+    const requestedPath = opencodePathArg(parsed.args) ?? ""
     const editPath = typeof display.args.path === "string" ? display.args.path : ""
     if (!requestedPath || !editPath) return false
 
@@ -2134,7 +2244,7 @@ export async function pump(
    */
   const rejectMissingReadTarget = (parsed: ParsedExecRequest): boolean => {
     if (parsed.toolName !== "read") return false
-    const requested = typeof parsed.args.filePath === "string" ? parsed.args.filePath : ""
+    const requested = opencodePathArg(parsed.args) ?? ""
     if (!requested) return false
     // A scheme-addressed target is the advertised host executor's to resolve,
     // not a local file to stat. Rejecting it here would make any URI-backed
@@ -2469,6 +2579,8 @@ export async function pump(
             requestContext: session.requestContext,
             toolCatalog: session.toolCatalog ?? [],
             postCompactionRebase: session.postCompactionRebase,
+            hostAgent: session.hostAgent,
+            systemPromptHash: session.stableSystemPromptHash,
           },
         ).catch((error) => {
           trace(
@@ -2721,7 +2833,7 @@ export async function pump(
       } else {
         replaySafety.markBarrier("non-control-exec")
         const displayCallId = extractExecDisplayCallId(esm)
-        const parsed = parseExecServerMessage(esm)
+        const parsed = parseExecServerMessage(esm, session.hostToolDialect)
         if (parsed) {
           const executableToolName = resolveCustomWebToolAlias(parsed.toolName, session.toolAliases)
           if (executableToolName !== parsed.toolName) {
@@ -2731,7 +2843,7 @@ export async function pump(
           remapNativeSubagentForCatalog(parsed, advertisedToolNameSet, session.subagentCatalog)
           // SubagentArgs has no description; Cursor's real title lives on the
           // correlated display TaskToolCall. Prefer that over the 5-word prompt slice.
-          if (displayCallId && parsed.toolName === "task") {
+          if (displayCallId && (parsed.toolName === "task" || parsed.toolName === "subagent")) {
             const stored = session.displayToolCalls.get(displayCallId)
             const display = parseDisplayToolCall(displayCallId, stored)
             if (display?.variant === "task_tool_call") {
@@ -3078,10 +3190,18 @@ export async function pump(
         setActiveCursorMode(session.openCodeSessionId, sw.args.targetModeId, {
           bridgedPlanEntered: false,
         })
+        const hostAgentSwitchQueued = session.openCodeSessionId
+          ? queueHostAgentModeSwitch({
+            sessionID: session.openCodeSessionId,
+            targetModeID: sw.args.targetModeId,
+            cursorSessionID: session.sessionId,
+          })
+          : false
         trace(
           `interaction_query: APPROVED switch_mode id=${handled.id} ` +
             `target=${JSON.stringify(sw.args.targetModeId)} (no host plan tool; ` +
-            `provider-owned mode) cursorToolCallId=${sw.toolCallId || "(none)"}`,
+            `${hostAgentSwitchQueued ? "native host-agent switch queued" : "provider-owned fallback"}) ` +
+            `cursorToolCallId=${sw.toolCallId || "(none)"}`,
         )
         continue
       }
@@ -3400,8 +3520,16 @@ export function buildOpenCodeInteractionGuidance(
       `- To read an MCP resource, call \`${CUSTOM_READ_MCP_RESOURCE_TOOL}\`; do not use Cursor's native resource-reading interaction.`,
     )
   }
-  if (names.has("task")) {
-    const target = "`task`"
+  if (names.has("execute")) {
+    const shell = names.has("shell") ? "`shell`" : names.has("bash") ? "`bash`" : undefined
+    instructions.push(
+      shell
+        ? `- OpenCode \`execute\` is Code Mode JavaScript (\`code\`); it is not a shell. For OS commands, call OpenCode ${shell}. Do not pass \`command\` to \`execute\`.`
+        : "- OpenCode `execute` is Code Mode JavaScript (`code`); it is not a shell. Do not pass `command` to `execute`.",
+    )
+  }
+  if (names.has("task") || names.has("subagent")) {
+    const target = names.has("task") ? "`task`" : "`subagent`"
     const available = subagents.agents.map((agent) => `\`${agent.name}\``).join(", ")
     instructions.push(
       `- Native Cursor Task/subagent requests are executed through OpenCode ${target}. ` +
@@ -3720,15 +3848,35 @@ export async function resolveTurnToolState(input: {
 export function resolveTurnConversationReset(input: {
   sessionKey?: string
   isCompaction: boolean
-}): { reset: boolean; reason?: "compaction" | "post-compaction-rebase" } {
+  promptIdentity?: PromptIdentity
+}): {
+  reset: boolean
+  reason?: "compaction" | "post-compaction-rebase" | "agent-change" | "system-prompt-change"
+} {
   const { sessionKey, isCompaction } = input
   if (isCompaction) {
     if (sessionKey) rememberPostCompactionRebase(sessionKey)
     return { reset: true, reason: "compaction" }
   }
+
+  let promptChange: "agent-change" | "system-prompt-change" | undefined
+  if (sessionKey && input.promptIdentity) {
+    const current = normalizePromptIdentity(input.promptIdentity)
+    const previous = promptIdentityBySession.get(sessionKey)
+    if (previous && promptIdentityChanged(previous, current)) {
+      promptChange = current.hostAgent !== undefined && previous.hostAgent !== current.hostAgent
+        ? "agent-change"
+        : "system-prompt-change"
+    }
+    rememberPromptIdentity(sessionKey, {
+      ...previous,
+      ...current,
+    })
+  }
   if (sessionKey && postCompactionRebaseBySession.delete(sessionKey)) {
     return { reset: true, reason: "post-compaction-rebase" }
   }
+  if (promptChange) return { reset: true, reason: promptChange }
   return { reset: false }
 }
 
@@ -3739,6 +3887,7 @@ export function resetTurnStateForTests(): void {
   toolCatalogWaitersBySession.clear()
   toolCatalogBySession.clear()
   postCompactionRebaseBySession.clear()
+  promptIdentityBySession.clear()
   mirroredTodosBySession.clear()
 }
 

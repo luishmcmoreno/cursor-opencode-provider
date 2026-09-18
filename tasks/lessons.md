@@ -261,6 +261,51 @@
   result, path, and schema translation in OCP. This keeps architectural cleanup
   from silently deleting working compatibility.
 
+## 2026-09-18 — OpenCode 2 dropped host todowrite; Task is `subagent`
+
+- **A missing host builtin is not a dialect bug.** OpenCode 2 has no
+  `todowrite`/`todoread` in `packages/core/src/tool/plugin/`; planning there is
+  a Plan **agent**, not a todo tool. Plugin-owned canonical todo names are an
+  opt-in fallback only: register them through `ctx.tool.transform` when
+  `CURSOR_OPENCODE2_TODOS=1`/`true` and `editor.get`/`list` does not already own
+  them. With the flag off, register none. Do not invent `plan_enter`/`plan_exit`
+  just to fill the catalog: SwitchMode already degrades, and a `plan_exit` tool
+  that cannot ask the user would skip the execution gate.
+- **Store plugin-owned todos in-memory per session, not in restart state.**
+  Same lifetime as `mirroredTodosBySession`. Clear on `session.deleted`. Do not
+  persist into the prompt or checkpoint.
+- **OpenCode 2's executor is `subagent`, not `task`.** `parseExec` still emits
+  `task`; `remapNativeSubagentForCatalog` must pick `task` when advertised else
+  rewrite to `subagent` with `agent` / `sessionID` / `background`. Parse
+  "Available subagents:" inline lists as well as the 1.x Task catalog marker.
+- **OpenCode `execute` is Code Mode, not a shell.** The host tool is named
+  `execute` and takes `{ code }` (JS). Calling it with `{ command }` fails
+  (`code: Missing key`) and looks like "Code Mode rather than shell". OS
+  commands go to `shell`/`bash`. Do not invent "file too large" when a search
+  tool returns empty — `test/tools.test.ts` is ~80 KB; verify with Read or
+  `rg` via `shell`.
+
+## 2026-09-18 — OpenCode 2 plugin tools must be direct catalog tools
+
+- **`codemode !== false` hides a plugin tool from the AI SDK catalog.** OpenCode
+  2 splits the snapshot: `codemode === false` is advertised to the model;
+  everything else is Code Mode-only (`packages/core/src/tool.ts` direct vs
+  `codeModeTools`). Plugin-owned `todowrite`/`todoread` need that flag so
+  Cursor TodoWrite mirroring can run.
+- **Returning `output` without an `output` schema is a host die, not a tool
+  error.** `packages/core/src/tool/runtime.ts` dies with `Tool result declared
+  output without an output schema`. Live `execute` → `tools.todoread({})`
+  hit that. Declare the schema (JSON Schema is a valid `ValueSchema`) or omit
+  `output` from the result.
+- **Do not register permission-sensitive direct tools through the 2.0 public
+  `ToolContext`.** It exposes session/agent/message/call identity and progress,
+  but no permission-request method. The provider aliases the host's native
+  permission-gated `websearch` → `custom_websearch` and supplies an Exa backend
+  through `ctx.websearch.transform`; a second direct fallback would bypass
+  `ask`. For the same reason, stock 2.0 must not advertise
+  `cursor_image_save`: refuse generation/binary writes before staging until the
+  public API can raise `external_directory` and `edit`.
+
 ## 2026-09-15 — Cursor native todos mirror into host todowrite/todoread
 
 - **Cursor TodoWrite/TodoRead are display completions, not exec requests.** When

@@ -2,7 +2,13 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 import type { Hooks, PluginInput, AuthOAuthResult, Config } from "@opencode-ai/plugin"
 import type { Auth } from "@opencode-ai/sdk"
-import { CURSOR_COMPACTION_OPTION, CURSOR_PROVIDER_ID, CURSOR_WEBSITE_HOST, CURSOR_API_HOST } from "./shared.js"
+import {
+  CURSOR_API_HOST,
+  CURSOR_COMPACTION_OPTION,
+  CURSOR_HOST_AGENT_OPTION,
+  CURSOR_PROVIDER_ID,
+  CURSOR_WEBSITE_HOST,
+} from "./shared.js"
 import { cursorApiBaseURL, cursorGetServerConfigTelemetryEnabled } from "./plugin-core.js"
 import { pollForTokens, exchangeApiKey, refreshAccessToken, isExpiringSoon, generatePkceParams, generatePkceChallenge, buildLoginUrl, decodeJwtExpiryMs } from "./auth.js"
 import { readCache, discoverModels, isCacheFresh } from "./models.js"
@@ -288,6 +294,10 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
 
     async "chat.params"(hookInput, output) {
       if (hookInput.model.providerID !== CURSOR_PROVIDER_ID) return
+      // Agent changes can replace the host system prompt and mode contract.
+      // Carry the canonical OpenCode id so an incompatible Cursor checkpoint
+      // is rotated instead of resuming the prior agent's prompt.
+      output.options[CURSOR_HOST_AGENT_OPTION] = hookInput.agent
       // OpenCode's compaction pipeline invokes the LLM with agent="compaction".
       // Carry that stable runtime fact into LanguageModelV3 providerOptions so
       // the provider never has to guess from an empty tool list.

@@ -19,6 +19,12 @@ import {
 import { parseDisplayToolCall, resolveBridgedOpenCodeToolCall } from "../src/protocol/tool-call-bridge.js"
 import { deliverContinuationResults, pump } from "../src/language-model.js"
 import { sessionManager, type CursorSession, type Frame } from "../src/session.js"
+import {
+  flushHostAgentModeSwitch,
+  queueHostAgentModeSwitch,
+  resetHostAgentModeSwitchForTests,
+  setHostAgentModeSwitch,
+} from "../src/host-agent-mode.js"
 
 function switchModeArgs(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -454,9 +460,16 @@ async function runSwitchMode(payloads: Uint8Array[], advertised: string[]) {
 }
 
 describe("SwitchMode over a held-open Run without host plan tools", () => {
-  beforeEach(() => resetActiveCursorModesForTests())
+  beforeEach(() => {
+    resetActiveCursorModesForTests()
+    resetHostAgentModeSwitchForTests()
+  })
 
   it("approves plan entry inline, emits no tool call, and keeps pumping", async () => {
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ sessionID, targetModeID }) => {
+      switched.push(`${sessionID}:${targetModeID}`)
+    })
     // The exact live failure: 65 tools advertised, neither of them a plan tool.
     const { session, writes, parts } = await runSwitchMode(
       [switchModePayload(), turnEnded],
@@ -483,10 +496,19 @@ describe("SwitchMode over a held-open Run without host plan tools", () => {
     expect(reminder).toContain("record the finished plan (Cursor CreatePlan)")
     expect(reminder).toContain("asked whether to start implementing")
     expect(reminder).not.toContain("call OpenCode `plan_exit`")
+    expect(await flushHostAgentModeSwitch(session.openCodeSessionId, {
+      cursorSessionID: session.sessionId,
+      terminal: true,
+    })).toBe(true)
+    expect(switched).toEqual(["switch-mode-opencode-session:plan"])
     sessionManager.close(session, "ordinary-cleanup")
   })
 
   it("asks the user before leaving plan mode, then approves on Yes", async () => {
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ sessionID, targetModeID }) => {
+      switched.push(`${sessionID}:${targetModeID}`)
+    })
     const { session, writes, parts } = await runSwitchMode(
       [switchModePayload(switchModeArgs({ target_mode_id: "agent" }))],
       ["question", "read", "write"],
@@ -512,6 +534,11 @@ describe("SwitchMode over a held-open Run without host plan tools", () => {
     expect(writes).toHaveLength(1)
     const response = decodeMessage<any>("AgentClientMessage", writes[0]!).interaction_response
     expect(response.switch_mode_request_response.approved).toBeDefined()
+    expect(await flushHostAgentModeSwitch(session.openCodeSessionId, {
+      cursorSessionID: session.sessionId,
+      terminal: true,
+    })).toBe(true)
+    expect(switched).toEqual(["switch-mode-opencode-session:agent"])
     sessionManager.close(session, "ordinary-cleanup")
   })
 
@@ -534,6 +561,26 @@ describe("SwitchMode over a held-open Run without host plan tools", () => {
     const response = decodeMessage<any>("AgentClientMessage", writes[0]!).interaction_response
     expect(response.switch_mode_request_response.rejected.reason).toBe(USER_REJECTED_REASON)
     sessionManager.close(session, "ordinary-cleanup")
+  })
+
+  it("discards a queued native-agent switch when its owning Run was superseded", async () => {
+    const switched: string[] = []
+    setHostAgentModeSwitch(({ targetModeID }) => switched.push(targetModeID))
+    expect(queueHostAgentModeSwitch({
+      sessionID: "oc-session",
+      cursorSessionID: "cursor-old",
+      targetModeID: "plan",
+    })).toBe(true)
+
+    expect(await flushHostAgentModeSwitch("oc-session", {
+      cursorSessionID: "cursor-new",
+      terminal: true,
+    })).toBe(false)
+    expect(await flushHostAgentModeSwitch("oc-session", {
+      cursorSessionID: "cursor-old",
+      terminal: true,
+    })).toBe(false)
+    expect(switched).toEqual([])
   })
 })
 

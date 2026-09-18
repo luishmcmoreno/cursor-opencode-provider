@@ -529,10 +529,18 @@ const refreshesByDirectory = new Map<string, Promise<ModelInfo[]>>()
 export async function refreshModelCache(
   cacheDir: string,
   fetcher: () => Promise<ModelInfo[]>,
+  options: { forceAfterInflight?: boolean } = {},
 ): Promise<ModelInfo[]> {
   const key = path.resolve(cacheDir)
   const existing = refreshesByDirectory.get(key)
-  if (existing) return existing
+  if (existing) {
+    if (!options.forceAfterInflight) return existing
+    // An account switch must not join a background refresh authenticated as
+    // the previous account. Wait for that write to finish, then run this
+    // caller's fetch so its account inventory is authoritative on disk.
+    await existing.catch(() => {})
+    return refreshModelCache(cacheDir, fetcher, options)
+  }
   const refresh = (async () => {
     const models = await fetcher()
     await writeCache(cacheDir, {
@@ -553,14 +561,32 @@ export async function refreshModelCache(
 export async function discoverModels(
   token: string,
   cacheDir: string,
-  options: { baseURL?: string; headers?: Record<string, string>; timeoutMs?: number } = {},
+  options: {
+    baseURL?: string
+    headers?: Record<string, string>
+    timeoutMs?: number
+    /**
+     * Bypass even a fresh cache and require an authoritative response.
+     *
+     * Model availability is account-scoped. Callers use this after a
+     * credential switch so a fresh cache produced by the previous account is
+     * never rebound to the new connection. A forced refresh rejects on fetch
+     * failure; the caller can keep the already-published inventory unchanged.
+     */
+    forceRefresh?: boolean
+  } = {},
 ): Promise<ModelInfo[]> {
+  const { forceRefresh = false, ...fetchOptions } = options
   const cached = await readCache(cacheDir)
   const refresh = () =>
-    refreshModelCache(cacheDir, () => fetchModels(token, options))
+    refreshModelCache(
+      cacheDir,
+      () => fetchModels(token, fetchOptions),
+      { forceAfterInflight: forceRefresh },
+    )
 
   // Cache is fresh → return it; refresh in background
-  if (cached && isCacheFresh(cached)) {
+  if (!forceRefresh && cached && isCacheFresh(cached)) {
     // Background refresh (fire and forget)
     void refresh()
       .catch(() => {
@@ -573,7 +599,8 @@ export async function discoverModels(
   if (cached) {
     try {
       return await refresh()
-    } catch {
+    } catch (error) {
+      if (forceRefresh) throw error
       return cached.models
     }
   }
