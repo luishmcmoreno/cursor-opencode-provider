@@ -4,7 +4,7 @@ import {
   progressOnlyContinuationPrompt,
   shouldContinueProgressOnlyTurn,
 } from "../src/protocol/progress-continuation.js"
-import { appendWorkspaceRootGrounding } from "../src/protocol/workspace-grounding.js"
+import { appendCheckpointUserGrounding, appendWorkspaceRootGrounding } from "../src/protocol/workspace-grounding.js"
 
 const CONTINUE = true
 const STOP = false
@@ -84,5 +84,41 @@ describe("appendWorkspaceRootGrounding", () => {
     const grounded = appendWorkspaceRootGrounding("denied", "/tmp/project")
     expect(grounded).toContain("Workspace root: \"/tmp/project\"")
     expect(appendWorkspaceRootGrounding(grounded, "/other")).toBe(grounded)
+  })
+
+  it("adds the absolute-path sentence only when requested, and only once", () => {
+    const grounded = appendWorkspaceRootGrounding("denied", "/tmp/project", {
+      requireAbsolutePathArg: true,
+    })
+    expect(grounded).toContain("take `path` as an absolute path")
+    expect(appendWorkspaceRootGrounding(grounded, "/tmp/project", { requireAbsolutePathArg: true })).toBe(grounded)
+
+    const later = appendWorkspaceRootGrounding(
+      appendWorkspaceRootGrounding("denied", "/tmp/project"),
+      "/tmp/project",
+      { requireAbsolutePathArg: true },
+    )
+    expect(later.startsWith("denied\nWorkspace root:")).toBe(true)
+    expect(later).toContain("take `path` as an absolute path")
+    expect(appendWorkspaceRootGrounding("denied", undefined, { requireAbsolutePathArg: true })).toBe("denied")
+  })
+})
+
+describe("appendCheckpointUserGrounding", () => {
+  it("appends the root to a later user turn and stays idempotent", () => {
+    expect(appendCheckpointUserGrounding("fix it", undefined)).toBe("fix it")
+    expect(appendCheckpointUserGrounding("", "  ")).toBe("")
+
+    const note = appendCheckpointUserGrounding("", "/tmp/project")
+    expect(note.startsWith("Workspace root:")).toBe(true)
+    expect(note.startsWith("\n")).toBe(false)
+
+    const grounded = appendCheckpointUserGrounding("fix it", "/tmp/project", {
+      requireAbsolutePathArg: true,
+    })
+    expect(grounded.startsWith("fix it\n\nWorkspace root:")).toBe(true)
+    expect(grounded).toContain(JSON.stringify("/tmp/project"))
+    expect(grounded).toContain("take `path` as an absolute path")
+    expect(appendCheckpointUserGrounding(grounded, "/other", { requireAbsolutePathArg: true })).toBe(grounded)
   })
 })

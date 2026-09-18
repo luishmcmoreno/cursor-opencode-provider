@@ -4,6 +4,7 @@ import {
   buildOpenCodeInteractionGuidance,
   estimateTokens,
   extractPromptHistory,
+  groundCheckpointTurnText,
 } from "../src/language-model.js"
 import { buildSeedConversationState } from "../src/protocol/request.js"
 import { decodeMessage } from "../src/protocol/messages.js"
@@ -85,6 +86,27 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("without claiming a missing MCP tool")
     expect(guidance).not.toContain("OpenCode `question` tool")
     expect(buildOpenCodeInteractionGuidance([], false, "/workspace/project")).toBeUndefined()
+  })
+
+  it("requires absolute path arguments when the host file tools use path", () => {
+    const opencode2 = buildOpenCodeInteractionGuidance([
+      {
+        name: "read",
+        inputSchema: { type: "object", properties: { path: { type: "string" } } },
+      },
+      { name: "shell" },
+    ], false, "/workspace/project")
+    expect(opencode2).toContain("take `path` as an absolute path")
+    expect(opencode2).toContain("do not invent a different absolute prefix")
+
+    const classic = buildOpenCodeInteractionGuidance([
+      {
+        name: "read",
+        inputSchema: { type: "object", properties: { filePath: { type: "string" } } },
+      },
+      { name: "bash" },
+    ], false, "/workspace/project")
+    expect(classic).not.toContain("take `path` as an absolute path")
   })
 
   it("anchors paths to the exact workspace root", () => {
@@ -292,5 +314,48 @@ describe("buildSeedConversationState history", () => {
       { role: "user", content: "hi" },
       { role: "assistant", content: "hello" },
     ])
+  })
+})
+
+describe("groundCheckpointTurnText", () => {
+  const root = "/workspace/project"
+  const pathTools = [{
+    name: "read",
+    inputSchema: { type: "object", properties: { path: { type: "string" } } },
+  }]
+  const filePathTools = [
+    {
+      name: "read",
+      inputSchema: { type: "object", properties: { filePath: { type: "string" } } },
+    },
+    { name: "bash" },
+  ]
+
+  it("leaves a fresh turn unchanged", () => {
+    expect(groundCheckpointTurnText("fix it", false, root, pathTools)).toBe("fix it")
+  })
+
+  it("restates the root on a checkpoint and requires path only for that dialect", () => {
+    const grounded = groundCheckpointTurnText("fix it", true, root, pathTools)
+    expect(grounded.startsWith("fix it\n\nWorkspace root:")).toBe(true)
+    expect(grounded).toContain(JSON.stringify(root))
+    expect(grounded).toContain("take `path` as an absolute path")
+    expect(grounded).toContain("never invent an absolute prefix")
+    expect(groundCheckpointTurnText(grounded, true, "/other", pathTools)).toBe(grounded)
+
+    const classic = groundCheckpointTurnText("fix it", true, root, filePathTools)
+    expect(classic).toContain("Workspace root:")
+    expect(classic).not.toContain("take `path` as an absolute path")
+
+    const inferred = groundCheckpointTurnText("fix it", true, root, [{ name: "shell" }])
+    expect(inferred).toContain("take `path` as an absolute path")
+    expect(groundCheckpointTurnText("fix it", true, root, [{ name: "bash" }])).not.toContain(
+      "take `path` as an absolute path",
+    )
+  })
+
+  it("does not invent a root when none is known", () => {
+    expect(groundCheckpointTurnText("fix it", true, "  ", pathTools)).toBe("fix it")
+    expect(groundCheckpointTurnText("", true, root, pathTools).startsWith("Workspace root:")).toBe(true)
   })
 })

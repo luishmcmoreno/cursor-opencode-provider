@@ -49,7 +49,7 @@ import {
 } from "./protocol/tools.js"
 import { buildGitDiffExecMessages } from "./protocol/git-diff.js"
 import { cursorExecVariantByRequestField, describeCursorExecVariant } from "./protocol/exec-variants.js"
-import { appendWorkspaceRootGrounding } from "./protocol/workspace-grounding.js"
+import { appendCheckpointUserGrounding, appendWorkspaceRootGrounding } from "./protocol/workspace-grounding.js"
 import {
   progressOnlyContinuationPrompt,
   shouldContinueProgressOnlyTurn,
@@ -1094,12 +1094,15 @@ async function startSession(
   }
 
   const lastUser = [...prompt].reverse().find((message) => message.role === "user")
-  const userText = recovery?.kind === "rebase"
+  let userText = recovery?.kind === "rebase"
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (extractUserText(lastUser) || ".")
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
   const startedWithCheckpoint = !!conversationState
+  if (startedWithCheckpoint) {
+    userText = groundCheckpointTurnText(userText, true, workspaceRoot, cursorTools)
+  }
   const activeMode = getActiveCursorMode(sessionKey)
   const nativePlanPromptOwnsMode = hostAgent === "plan"
     && (activeMode === "plan" || activeMode === "spec")
@@ -3446,6 +3449,23 @@ function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): stri
 }
 
 /**
+ * Checkpointed Runs do not resend the system prompt. Keep the workspace root
+ * on the live user message, and require absolute `path` arguments when that is
+ * the host's file-tool dialect.
+ */
+export function groundCheckpointTurnText(
+  userText: string,
+  checkpoint: boolean,
+  workspaceRoot: string,
+  tools: readonly { name?: string; inputSchema?: unknown }[],
+): string {
+  if (!checkpoint) return userText
+  return appendCheckpointUserGrounding(userText, workspaceRoot, {
+    requireAbsolutePathArg: hostToolDialectFromTools(tools).filePathKey === "path",
+  })
+}
+
+/**
  * Cursor's native UI interactions cannot be surfaced through the AI SDK.
  * Redirect only to OpenCode tools that are genuinely advertised this turn;
  * compaction keeps its dedicated summary prompt unchanged.
@@ -3555,6 +3575,11 @@ export function buildOpenCodeInteractionGuidance(
     // leaving the turn with no file-editing guidance at all.
     instructions.push(
       "- Use OpenCode `apply_patch` for file-content changes; do not use shell, Python, or heredocs to change file content while it is available. Cursor-native write and edit requests are accepted and converted to `apply_patch` automatically.",
+    )
+  }
+  if (hostToolDialectFromTools(tools).filePathKey === "path") {
+    instructions.push(
+      "- OpenCode file tools take `path` as an absolute path under the workspace root above. Do not pass a project-relative path, and do not invent a different absolute prefix.",
     )
   }
   if (names.has("edit") || names.has("write") || names.has("apply_patch")) {

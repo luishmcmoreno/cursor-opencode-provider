@@ -1032,6 +1032,23 @@ export type ParsedExecRequest = {
   resultMetadata?: Record<string, unknown>
 }
 
+function readRequestResultMetadata(
+  raw: Record<string, unknown>,
+  mappedArgs: Record<string, unknown>,
+): Record<string, unknown> {
+  const requestedPath =
+    str(raw.path)
+    ?? str(raw.filePath)
+    ?? str(raw.file_path)
+    ?? opencodePathArg(mappedArgs)
+    ?? ""
+  return {
+    path: requestedPath,
+    ...(typeof mappedArgs.offset === "number" ? { offset: mappedArgs.offset } : {}),
+    ...(typeof mappedArgs.limit === "number" ? { limit: mappedArgs.limit } : {}),
+  }
+}
+
 /**
  * A partial-read notice is for Cursor's model, never for a file. Refuse only
  * whole-file mutation forms that echo it. A targeted edit or Update File patch
@@ -1060,11 +1077,14 @@ export function rejectPartialReadMutation(parsed: ParsedExecRequest): void {
 
   const filePath = opencodePathArg(parsed.args) ?? "the target file"
   const nextOffset = /Continue with offset=(\d+)/.exec(content)?.[1]
+  const longLine = content.includes("Use a byte-preserving read method")
   parsed.localError =
     `NO FILE CHANGE WAS MADE. Refusing a whole-file mutation of ${JSON.stringify(filePath)} ` +
     "because it contains the provider's partial-read notice. Do not retry the same mutation. " +
     (nextOffset
       ? `Read the file from offset=${nextOffset}, then use a targeted edit or Update File patch.`
+      : longLine
+        ? "Inspect the full line with a byte-preserving read method, then use a targeted edit or Update File patch."
       : "Read the remaining file ranges, then use a targeted edit or Update File patch.")
 }
 
@@ -1162,13 +1182,17 @@ export function parseExecServerMessage(
     // tool name (Cursor's model may have shortened "opencode-read" → "read") and
     // decode the argument map back into JSON for opencode to execute.
     const m = (msg.mcp_args as Record<string, unknown>) ?? {}
-    const mapped = mapCursorArgsToOpencode(mcpRealToolName(m), decodeMcpArgs(m.args), "mcp_args", dialect)
+    const rawArgs = decodeMcpArgs(m.args)
+    const mapped = mapCursorArgsToOpencode(mcpRealToolName(m), rawArgs, "mcp_args", dialect)
     return {
       id,
       execId,
       toolName: mapped.toolName,
       args: mapped.args,
       resultField,
+      ...(mapped.toolName === "read"
+        ? { resultMetadata: readRequestResultMetadata(rawArgs, mapped.args) }
+        : {}),
     }
   }
 
@@ -1210,12 +1234,8 @@ export function parseExecServerMessage(
   const rawArgs = (msg[execVariant] as Record<string, unknown>) ?? {}
   const resultMetadata = execVariant === "shell_stream_args" || execVariant === "shell_args"
     ? shellStreamResultMetadata(rawArgs)
-    : execVariant === "read_args"
-      ? {
-          path: str(rawArgs.path) ?? str(rawArgs.file_path) ?? "",
-          ...(typeof mapped.args.offset === "number" ? { offset: mapped.args.offset } : {}),
-          ...(typeof mapped.args.limit === "number" ? { limit: mapped.args.limit } : {}),
-        }
+    : execVariant === "read_args" || execVariant === "pi_read_args"
+      ? readRequestResultMetadata(rawArgs, mapped.args)
       : undefined
   if (
     resultMetadata
@@ -1607,9 +1627,10 @@ export function isUriReadTarget(requested: string): boolean {
  */
 export function resolveReadTargetPath(requested: string, workspaceRoot: string): string {
   const expanded = untildify(requested)
-  if (workspaceRoot && !path.isAbsolute(expanded)) {
-    return path.resolve(workspaceRoot, expanded)
+  if (isAbsoluteToolPath(expanded)) {
+    return isForeignAbsoluteToolPath(expanded) ? expanded : path.resolve(expanded)
   }
+  if (workspaceRoot) return joinToolPath(workspaceRoot, expanded)
   return path.resolve(expanded)
 }
 
@@ -1710,14 +1731,18 @@ export function buildExecClientMessages(input: ToolResultInput): Uint8Array[] {
   const frames: Uint8Array[] = []
 
   if (resultField === "shell_stream") {
+    const stdout = groundShellPathText(
+      input.output,
+      shellPathRoot(input.resultMetadata, input.workspaceRoot),
+    )
     // Real clients always emit Start → Stdout/Stderr* → Exit (capture/tests).
     frames.push(encodeShellStream(input.execId, undefined, { start: {} }))
     if (input.error) {
       frames.push(encodeShellStream(input.execId, undefined, { stderr: { data: input.error } }))
       frames.push(encodeShellStream(input.execId, input.executionTimeMs, { exit: { code: 1, aborted: false } }))
     } else {
-      if (input.output) {
-        frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: input.output } }))
+      if (stdout) {
+        frames.push(encodeShellStream(input.execId, undefined, { stdout: { data: stdout } }))
       }
       if (input.shellOutcome?.kind === "backgrounded") {
         frames.push(encodeShellStream(input.execId, input.executionTimeMs, {
@@ -1971,17 +1996,413 @@ export function buildUnsupportedExecDeny(input: {
   return frames
 }
 
+/** OpenCode 2 `read` prints this when a text page does not reach EOF. */
+const OPENCODE2_READ_TRUNCATION = /^\[Output truncated\. Continue reading with offset:\s*(\d+)\]\s*$/
+/** OpenCode 2 stops a read at 2,000 lines as well as 50 KB. */
+const OPENCODE2_READ_MAX_LINES = 2_000
+const OPENCODE2_READ_MAX_LINE_CHARS = 2_000
+const OPENCODE2_READ_LINE_TRUNCATION = `... (line truncated to ${OPENCODE2_READ_MAX_LINE_CHARS} chars)`
+/**
+ * `read-filesystem.ts` shortens each selected line to 2,000 UTF-16 code units.
+ * One code unit encodes to at most three UTF-8 bytes. Add the 34-byte
+ * `... (line truncated to 2000 chars)` suffix and one line separator when
+ * proving a page was close enough for the next line not to fit.
+ */
+const OPENCODE2_MAX_RENDERED_LINE_BYTES =
+  (OPENCODE2_READ_MAX_LINE_CHARS * 3) + Buffer.byteLength(OPENCODE2_READ_LINE_TRUNCATION, "utf8") + 1
+
+type OpenCode2FileRead = {
+  path: string
+  content: string
+  startLine?: number
+  endLine?: number
+  totalLines?: number
+  nextOffset?: number
+  /** Host ended the page before EOF (`[Output truncated…]`). */
+  hostTruncated: boolean
+  /** Page stopped on the 50 KB byte budget, not only the line budget. */
+  outputCapped: boolean
+  /** Lines shortened by OpenCode 2's per-line 2,000-character ceiling. */
+  truncatedLines: number[]
+}
+
+function normalizeToolText(output: string): string {
+  return output.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+}
+
+/**
+ * OpenCode 2 `ReadTool.toModelContent` for a file. The whole string must match;
+ * a file that merely quotes the header stays a numbered body line.
+ *
+ *   Read file <path>, lines <start>-<end>
+ *   <n>: <line>
+ *   [Output truncated. Continue reading with offset: <next>]
+ */
+function parseOpenCode2FileRead(
+  output: string,
+  resultMetadata?: Record<string, unknown>,
+): OpenCode2FileRead | undefined {
+  const normalized = normalizeToolText(output).replace(/\n+$/, "")
+  if (!normalized.startsWith("Read file ")) return undefined
+  const lines = normalized.split("\n")
+  const headerLine = (lines[0] ?? "").trim()
+  const empty = /^Read file (.*), 0 lines$/.exec(headerLine)
+  if (empty) {
+    if (lines.length !== 1) return undefined
+    return {
+      path: empty[1] ?? "",
+      content: "",
+      totalLines: 0,
+      hostTruncated: false,
+      outputCapped: false,
+      truncatedLines: [],
+    }
+  }
+  const header = /^Read file (.*), lines (\d+)-(\d+)$/.exec(headerLine)
+  if (!header) return undefined
+  const start = Number(header[2])
+  const end = Number(header[3])
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start) {
+    return undefined
+  }
+  let bodyEnd = lines.length
+  let nextOffset: number | undefined
+  const banner = OPENCODE2_READ_TRUNCATION.exec(lines[lines.length - 1] ?? "")
+  if (banner) {
+    nextOffset = Number(banner[1])
+    if (!Number.isSafeInteger(nextOffset) || nextOffset < 1) return undefined
+    bodyEnd -= 1
+  }
+  const expected = end - start + 1
+  if (bodyEnd - 1 !== expected) return undefined
+  const raw: string[] = []
+  const truncatedLines: number[] = []
+  for (let index = 0; index < expected; index++) {
+    const match = /^(\d+):[ \t](.*)$/.exec(lines[index + 1] ?? "")
+    if (!match || Number(match[1]) !== start + index) return undefined
+    const value = match[2] ?? ""
+    if (
+      value.length === OPENCODE2_READ_MAX_LINE_CHARS + OPENCODE2_READ_LINE_TRUNCATION.length
+      && value.endsWith(OPENCODE2_READ_LINE_TRUNCATION)
+    ) {
+      truncatedLines.push(start + index)
+    }
+    raw.push(value)
+  }
+  const content = raw.join("\n")
+  const hostTruncated = nextOffset !== undefined
+  const requestedLimit = num(resultMetadata?.limit)
+  const effectiveLineLimit = requestedLimit !== undefined && requestedLimit > 0
+    ? Math.min(requestedLimit, OPENCODE2_READ_MAX_LINES)
+    : OPENCODE2_READ_MAX_LINES
+  // OpenCode 2 ends a text page only for the requested/default line limit or
+  // the 50 KiB byte limit. Fewer lines than the effective line limit, together
+  // with a page close enough that one maximum-size rendered line may not fit,
+  // identifies the byte cap without the old ASCII-only 4 KiB guess.
+  const outputCapped = hostTruncated
+    && expected < effectiveLineLimit
+    && Buffer.byteLength(content, "utf8") > OPENCODE_READ_MAX_BYTES - OPENCODE2_MAX_RENDERED_LINE_BYTES
+  if (hostTruncated) {
+    return {
+      path: header[1] ?? "",
+      content,
+      startLine: start,
+      endLine: end,
+      nextOffset,
+      hostTruncated: true,
+      outputCapped,
+      truncatedLines,
+    }
+  }
+  // A page that reached EOF is complete. Record the span so a non-1 offset is
+  // not later mistaken for a silent cap, without flagging it truncated.
+  return {
+    path: header[1] ?? "",
+    content,
+    ...(start === 1
+      ? { totalLines: end }
+      : { startLine: start, endLine: end, totalLines: end }),
+    hostTruncated: false,
+    outputCapped: false,
+    truncatedLines,
+  }
+}
+
+type OpenCode2DirectoryListing = {
+  text: string
+  directory: string
+  entries: string[]
+  directories: string[]
+  files: string[]
+}
+
+/**
+ * OpenCode 2 directory reads list bare entry names. Join them onto the
+ * directory, then onto the workspace root, so the model can copy a real path
+ * instead of inventing an absolute prefix.
+ */
+function parseOpenCode2DirectoryListing(
+  output: string,
+  workspaceRoot: string | undefined,
+): OpenCode2DirectoryListing | undefined {
+  const normalized = normalizeToolText(output).replace(/\n+$/, "")
+  if (!normalized.startsWith("Read directory ")) return undefined
+  const lines = normalized.split("\n")
+  const header = /^Read directory (.*), (?:0 entries|entries (\d+)-(\d+))$/.exec((lines[0] ?? "").trim())
+  if (!header) {
+    trace("parseOpenCode2DirectoryListing: OpenCode 2 directory header did not match — leaving output unchanged")
+    return undefined
+  }
+  const requested = header[1] ?? ""
+  if (!isAbsoluteToolPath(requested) && !workspaceRoot) return undefined
+  let bodyEnd = lines.length
+  let banner: string | undefined
+  if (bodyEnd > 1 && OPENCODE2_READ_TRUNCATION.test(lines[bodyEnd - 1] ?? "")) {
+    banner = lines[bodyEnd - 1]
+    bodyEnd -= 1
+  }
+  const rawEntries = lines.slice(1, bodyEnd)
+  if (header[2] === undefined) {
+    if (rawEntries.length !== 0) return undefined
+  } else {
+    const start = Number(header[2])
+    const end = Number(header[3])
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end - start + 1 !== rawEntries.length) {
+      return undefined
+    }
+  }
+  const directory = resolveToolPath(requested, workspaceRoot)
+  const directories: string[] = []
+  const files: string[] = []
+  const entries = rawEntries.map((entry) => {
+    const resolved = resolveListedEntry(directory, entry)
+    if (entry.endsWith("/") || entry.endsWith("\\")) directories.push(resolved)
+    else files.push(resolved)
+    return resolved
+  })
+  const headerLine = header[2] === undefined
+    ? `Read directory ${directory}, 0 entries`
+    : `Read directory ${directory}, entries ${header[2]}-${header[3]}`
+  return {
+    directory,
+    entries,
+    directories,
+    files,
+    text: [headerLine, ...entries, ...(banner ? [banner] : [])].join("\n"),
+  }
+}
+
+/**
+ * Absolute on this host, plus Windows drive and UNC paths. A posix agent must
+ * not prefix `C:/…` or `\\server\…` just because `path.isAbsolute` rejects them.
+ */
+function isAbsoluteToolPath(filePath: string): boolean {
+  return path.isAbsolute(filePath)
+    || /^[A-Za-z]:[\\/]/.test(filePath)
+    || filePath.startsWith("\\\\")
+}
+
+/** Windows drive or UNC path that `path.isAbsolute` rejects on this host. */
+function isForeignAbsoluteToolPath(filePath: string): boolean {
+  return isAbsoluteToolPath(filePath) && !path.isAbsolute(filePath)
+}
+
+/** Separator already used by a drive or UNC path. Host paths keep `path.sep`. */
+function toolPathSeparator(filePath: string): string {
+  if (path.isAbsolute(filePath)) return path.sep
+  if (filePath.startsWith("\\\\") || (filePath.includes("\\") && !filePath.includes("/"))) return "\\"
+  return "/"
+}
+
+/**
+ * Join `relative` onto `root`. Node's `path.resolve` treats `C:/…` and
+ * `\\server\…` as relative on posix and prefixes the process cwd. Keep those
+ * roots intact, including `..`, and still use `path.resolve` for host paths.
+ */
+function joinToolPath(root: string, relative: string): string {
+  if (!isForeignAbsoluteToolPath(root)) return path.resolve(root, relative)
+  const sep = toolPathSeparator(root)
+  const base = splitForeignAbsolute(root, sep)
+  const parts = [...base.segments]
+  for (const part of relative.split(/[\\/]+/)) {
+    if (!part || part === ".") continue
+    if (part === "..") {
+      if (parts.length > base.frozen) parts.pop()
+      continue
+    }
+    parts.push(part)
+  }
+  return parts.length === 0 ? base.prefix : `${base.prefix}${parts.join(sep)}`
+}
+
+function splitForeignAbsolute(
+  filePath: string,
+  sep: string,
+): { prefix: string; segments: string[]; frozen: number } {
+  if (filePath.startsWith("\\\\")) {
+    const segments = filePath.slice(2).split(/[\\/]+/).filter(Boolean)
+    return { prefix: "\\\\", segments, frozen: Math.min(2, segments.length) }
+  }
+  const rest = filePath.slice(2).replace(/^[\\/]+/, "")
+  return {
+    prefix: `${filePath.slice(0, 2)}${sep}`,
+    segments: rest ? rest.split(/[\\/]+/).filter(Boolean) : [],
+    frozen: 0,
+  }
+}
+
+function isRelativePathToken(token: string): boolean {
+  if (!token || isAbsoluteToolPath(token)) return false
+  // A slash alone does not make arbitrary shell output a path. In particular,
+  // compact JSON, quoted strings, package ids, and shell syntax must remain
+  // byte-for-byte model-visible rather than being prefixed with the workspace.
+  if (/[\0"'`{}\[\]<>|;]/.test(token) || token.startsWith("@")) return false
+  if (
+    token.startsWith("./")
+    || token.startsWith("../")
+    || token.startsWith(".\\")
+    || token.startsWith("..\\")
+  ) return true
+  return token.includes("/") || (path.sep === "\\" && token.includes("\\"))
+}
+
+function resolveListedEntry(directory: string, entry: string): string {
+  if (!entry || isAbsoluteToolPath(entry)) return entry
+  if (entry === "~" || entry.startsWith("~/") || entry.startsWith("~\\")) return entry
+  const directoryEntry = entry.endsWith("/") || entry.endsWith("\\")
+  const resolved = joinToolPath(directory, entry)
+  if (!directoryEntry || resolved.endsWith("/") || resolved.endsWith("\\")) return resolved
+  return `${resolved}${toolPathSeparator(resolved)}`
+}
+
+function resolveToolPath(filePath: string, workspaceRoot: string | undefined): string {
+  if (!filePath || isAbsoluteToolPath(filePath)) return filePath
+  if (filePath === "~" || filePath.startsWith("~/") || filePath.startsWith("~\\")) return filePath
+  if (!workspaceRoot) return filePath
+  return joinToolPath(workspaceRoot, filePath)
+}
+
+/**
+ * Rewrite OpenCode 2 grep/glob lines that are still project-relative. Absolute
+ * paths, indented match previews, and prose stay untouched. Grep file headers
+ * drop the trailing colon only in the structured file list, not in this text.
+ */
+function groundSearchOutput(output: string, workspaceRoot: string | undefined): string {
+  if (!workspaceRoot) return output
+  const normalized = normalizeToolText(output)
+  const first = normalized.split("\n", 1)[0] ?? ""
+  const searchShaped = /^Found \d+ matches/.test(first)
+    || first === "No matches found"
+    || first === "No files found"
+  if (!searchShaped && !isBarePathList(normalized)) return output
+  return normalized.split("\n").map((line) => rewriteSearchPathLine(line, workspaceRoot)).join("\n")
+}
+
+function isBarePathList(output: string): boolean {
+  const lines = output.split("\n").map((line) => line.trim()).filter(Boolean)
+  if (lines.length === 0 || lines.length > 2000) return false
+  return lines.every((line) => {
+    if (line.startsWith("(")) return true
+    if (/\s/.test(line) || line.includes("://")) return false
+    return true
+  })
+}
+
+function rewriteSearchPathLine(line: string, workspaceRoot: string): string {
+  if (!line || line.startsWith(" ") || line.startsWith("\t") || line.startsWith("(")) return line
+  if (line.startsWith("Found ") || line === "No matches found" || line === "No files found") return line
+  const header = /^(.*):$/.exec(line)
+  if (header && !header[1]?.includes("://")) {
+    return `${resolveToolPath(header[1] ?? "", workspaceRoot)}:`
+  }
+  if (line.includes("://")) return line
+  return resolveToolPath(line, workspaceRoot)
+}
+
+/**
+ * Shell stdout is mixed prose. Rewrite only tokens that are clearly relative
+ * paths, including `file:line` and `file:line:col`. Leave sentences, URLs, and
+ * status words alone.
+ */
+function groundShellPathText(output: string, root: string | undefined): string {
+  if (!root || !output) return output
+  return normalizeToolText(output).split("\n").map((line) => rewriteShellPathLine(line, root)).join("\n")
+}
+
+function shellPathRoot(
+  resultMetadata: Record<string, unknown> | undefined,
+  workspaceRoot: string | undefined,
+): string | undefined {
+  const workingDirectory = str(resultMetadata?.working_directory)?.trim()
+  if (!workingDirectory) return workspaceRoot
+  if (isAbsoluteToolPath(workingDirectory)) return workingDirectory
+  return workspaceRoot ? joinToolPath(workspaceRoot, workingDirectory) : undefined
+}
+
+function rewriteShellPathLine(line: string, root: string): string {
+  if (!line || line.startsWith(" ") || line.startsWith("\t")) return line
+  const trimmed = line.trimEnd()
+  if (trimmed.includes("://") || trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+    return line
+  }
+  const located = /^(.+?):(\d+)(?::(\d+))?$/.exec(trimmed)
+  if (located && located[1] && isRelativePathToken(located[1])) {
+    const suffix = located[3] !== undefined ? `:${located[2]}:${located[3]}` : `:${located[2]}`
+    return `${resolveToolPath(located[1], root)}${suffix}`
+  }
+  if (/\s/.test(trimmed)) return line
+  const header = /^(.*):$/.exec(trimmed)
+  if (header && header[1] && isRelativePathToken(header[1])) {
+    return `${resolveToolPath(header[1], root)}:`
+  }
+  if (isRelativePathToken(trimmed)) return resolveToolPath(trimmed, root)
+  return line
+}
+
+function extractGroundedPaths(output: string, workspaceRoot: string | undefined): string[] {
+  const normalized = normalizeToolText(output)
+  const directory = parseOpenCode2DirectoryListing(normalized, workspaceRoot)
+  if (directory) return directory.entries.slice(0, 2000)
+  const first = normalized.split("\n", 1)[0]?.trim() ?? ""
+  if (/^Found \d+ matches/.test(first) || first === "No matches found" || first === "No files found") {
+    const paths: string[] = []
+    for (const raw of normalized.split("\n").slice(1)) {
+      const line = raw.trim()
+      if (!line || line.startsWith("(") || line.startsWith("Line ") || raw.startsWith(" ") || raw.startsWith("\t")) {
+        continue
+      }
+      const header = /^(.*):$/.exec(line)
+      const candidate = header && !header[1]?.includes("://") ? (header[1] ?? "") : line
+      if (!candidate || candidate.includes("://")) continue
+      paths.push(resolveToolPath(candidate, workspaceRoot))
+    }
+    return paths.slice(0, 2000)
+  }
+  if (isBarePathList(output)) {
+    return output
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("("))
+      .map((line) => resolveToolPath(line.endsWith(":") && !line.includes("://") ? line.slice(0, -1) : line, workspaceRoot))
+      .slice(0, 2000)
+  }
+  return extractPathLines(output).map((line) => {
+    const trimmed = line.trim()
+    const candidate = trimmed.endsWith(":") && !trimmed.includes("://") ? trimmed.slice(0, -1) : trimmed
+    return resolveToolPath(candidate, workspaceRoot)
+  })
+}
+
 /**
  * Strip opencode's `read` envelope, leaving raw file content.
  *
- * opencode's read tool (opencode `tool/read.ts`) wraps content in an XML-ish
- * envelope its own models are trained on, but Cursor's are not:
+ * OpenCode 1.x (`tool/read.ts`) wraps content in an XML-ish envelope its own
+ * models are trained on, but Cursor's are not:
  *   <path>{abs}</path>\n<type>file</type>\n<content>\n{N}: {line}\n…\n\n{footer}\n</content>
- * Forwarding that envelope verbatim made Cursor's model treat the wrapper as
- * literal file content and write `<path>`/`<content>` tags + `N:` line prefixes
- * back into files (silent corruption — the write still reports success; seen
- * across 8+ sessions, e.g. language-model.ts rewritten starting with
- * `<path>…</path>\n<type>file</type>\n<content>\n1: import fs…`).
+ * OpenCode 2 replaced that with `Read file <path>, lines <start>-<end>` plus
+ * the same `N: ` prefixes and `[Output truncated. Continue reading with offset: N]`.
+ * Forwarding either envelope verbatim made Cursor's model treat the wrapper as
+ * literal file content and write tags or line prefixes back into files.
  *
  * Returns the raw file body (line numbers + footer + `<system-reminder>` dropped).
  *
@@ -1993,6 +2414,11 @@ export function buildUnsupportedExecDeny(input: {
  */
 export function unwrapReadOutput(output: string): string {
   if (typeof output !== "string" || output.length === 0) return output
+  const opencode2 = parseOpenCode2FileRead(output)
+  if (opencode2) return opencode2.content
+  if (normalizeToolText(output).startsWith("Read file ")) {
+    trace("unwrapReadOutput: OpenCode 2 read header did not match the page parser — leaving output unchanged")
+  }
   // Require the full opencode read-envelope skeleton *before* `<content>`
   // (read.ts opens with <path>…</path>, <type>file</type>, <content>) so a
   // stray "<content>" later in tool chatter can't trigger unwrapping just
@@ -2050,40 +2476,59 @@ export function buildTypedExecResult(
 ): Record<string, unknown> {
   // Prefer the session workspace; never advertise the host process cwd (daemon
   // often starts in $HOME) as the path Cursor shows the model for glob/ls.
-  const resultRoot =
-    typeof workspaceRoot === "string" && workspaceRoot.trim()
-      ? path.resolve(workspaceRoot)
-      : undefined
+  const trimmedRoot = typeof workspaceRoot === "string" ? workspaceRoot.trim() : ""
+  // A posix process must not turn `C:/…` or `\\server\…` into `<cwd>/C:/…`.
+  const resultRoot = trimmedRoot
+    ? (isForeignAbsoluteToolPath(trimmedRoot) ? trimmedRoot : path.resolve(trimmedRoot))
+    : undefined
   switch (resultField) {
     case "read_result": {
-      const readPath = str(resultMetadata?.path) ?? extractPathTag(output) ?? ""
+      const parsedFile = parseOpenCode2FileRead(output, resultMetadata)
+      const listing = error ? undefined : parseOpenCode2DirectoryListing(output, resultRoot)
+      const rawPath =
+        str(resultMetadata?.path)
+        ?? parsedFile?.path
+        ?? listing?.directory
+        ?? extractPathTag(output)
+        ?? ""
+      const readPath = resolveToolPath(rawPath, resultRoot)
       if (error) return { error: { path: readPath, error } }
-      // Strip opencode's <path>/<content> envelope so Cursor's model receives
-      // raw file content and can't echo the wrapper into subsequent writes.
+      // The host may have resolved an alternate spelling after the request
+      // (for example a Unicode-space filename). Use the result's own path for
+      // local stat/newline recovery while preserving the requested path in the
+      // Cursor result, matching the existing OpenCode 1 behavior.
+      const outputPath = parsedFile?.path ?? extractPathTag(output)
+      const statPath = resolveToolPath(outputPath ?? readPath, resultRoot)
+      // Strip OpenCode's read envelope so Cursor's model receives raw file
+      // content and can't echo the wrapper into subsequent writes.
       // Cursor's native read_args lands here; `mcp_args` reads land in
       // mcp_result. Live captures show gpt-5.4-mini and grok-4.5 both use the
       // native channel, so this is the path that matters in practice.
-      const statPath = extractPathTag(output) ?? readPath
-      const outputMetadata = parseOpenCodeReadMetadata(output)
-      const content = restoreCompleteReadTerminator(
-        unwrapReadOutput(output),
-        statPath,
-        outputMetadata,
-        resultMetadata,
-        resultRoot,
-      )
+      const outputMetadata = parseOpenCodeReadMetadata(output, resultMetadata)
+      const content = listing
+        ? listing.text
+        : restoreCompleteReadTerminator(
+            unwrapReadOutput(output),
+            statPath,
+            outputMetadata,
+            resultMetadata,
+            resultRoot,
+          )
       const totalLines = outputMetadata.totalLines ?? readFileLineCount(statPath) ?? countLines(content)
       const rangeApplied = readRangeApplied(resultMetadata, totalLines)
       // `truncated` alone is not enough: it is set here, and models still assert
       // the partial content is the whole file. Cursor's own executor puts the
       // limit marker in the output text for the same reason, so append one.
-      const notice = readTruncationNotice(output, resultMetadata)
+      const notices = [
+        readTruncationNotice(output, resultMetadata),
+        readLongLineTruncationNotice(output),
+      ].filter((notice): notice is string => !!notice)
       return {
         success: {
-          path: readPath,
-          content: notice ? `${content}\n\n${notice}` : content,
+          path: listing?.directory || readPath,
+          content: notices.length > 0 ? `${content}\n\n${notices.join("\n\n")}` : content,
           total_lines: totalLines,
-          file_size: readFileSize(statPath),
+          file_size: listing ? 0 : readFileSize(statPath),
           truncated: readOutputTruncated(resultMetadata, outputMetadata, totalLines),
           range_applied: rangeApplied,
         },
@@ -2093,7 +2538,7 @@ export function buildTypedExecResult(
       if (error) return { error: { error } }
       // Prefer files_with_matches: OpenCode glob/grep often returns path lists.
       // Content-mode GrepSuccess also works but needs GrepFileMatch nesting.
-      const files = extractPathLines(output)
+      const files = extractGroundedPaths(output, resultRoot)
       const cwd = resultRoot ?? ""
       return {
         success: {
@@ -2134,19 +2579,20 @@ export function buildTypedExecResult(
       // Pi results carry truncation structurally (PiReadExecSuccess field 2),
       // which is how Cursor's own executors report a capped payload.
       const content = unwrapReadOutput(output)
-      const truncation = readTruncationMessage(output, content)
+      const truncation = readTruncationMessage(output, content, resultMetadata)
       return { success: { output: content, ...(truncation ? { truncation } : {}) } }
     }
     case "shell_result": {
       const command = str(resultMetadata?.command) ?? ""
       const workingDirectory = str(resultMetadata?.working_directory) ?? ""
+      const stdout = groundShellPathText(output, shellPathRoot(resultMetadata, resultRoot))
       if (error) {
         return {
           failure: {
             command,
             working_directory: workingDirectory,
             exit_code: 1,
-            stdout: output || "",
+            stdout: stdout || "",
             stderr: error,
             aborted: false,
           },
@@ -2167,7 +2613,7 @@ export function buildTypedExecResult(
             command: shellOutcome.command || command,
             working_directory: shellOutcome.workingDirectory || workingDirectory,
             exit_code: 0,
-            stdout: output,
+            stdout: stdout,
             shell_id: shellOutcome.shellId,
             pid: shellOutcome.pid,
             ms_to_wait: shellOutcome.msToWait,
@@ -2185,17 +2631,25 @@ export function buildTypedExecResult(
           command,
           working_directory: workingDirectory,
           exit_code: exitCode,
-          stdout: output,
+          stdout: stdout,
         },
       }
     }
     case "pi_bash_result":
+      if (error) return { error: { error } }
+      return { success: { output: groundShellPathText(output, shellPathRoot(resultMetadata, resultRoot)) } }
     case "pi_edit_result":
-    case "pi_grep_result":
-    case "pi_find_result":
-    case "pi_ls_result":
       if (error) return { error: { error } }
       return { success: { output } }
+    case "pi_grep_result":
+    case "pi_find_result":
+      if (error) return { error: { error } }
+      return { success: { output: groundSearchOutput(output, resultRoot) } }
+    case "pi_ls_result": {
+      if (error) return { error: { error } }
+      const listing = parseOpenCode2DirectoryListing(output, resultRoot)
+      return { success: { output: listing?.text ?? groundSearchOutput(output, resultRoot) } }
+    }
     case "delete_result":
       if (error) return { error: { path: "", error } }
       return { success: { path: "", deleted_file: "" } }
@@ -2238,17 +2692,25 @@ export function buildTypedExecResult(
     }
     case "ls_result": {
       if (error) return { error: { path: "", error } }
-      const rootPath = resultRoot ?? ""
-      const entries = extractPathLines(output)
+      const listing = parseOpenCode2DirectoryListing(output, resultRoot)
+      const rootPath = listing?.directory || resultRoot || ""
+      const entries = listing ? listing.entries : extractGroundedPaths(output, resultRoot)
+      const directories = listing?.directories ?? []
+      const files = listing?.files ?? entries
       return {
         success: {
           directory_tree_root: {
             abs_path: rootPath,
-            children_dirs: [],
-            children_files: entries.map((name) => ({
-              name: name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name,
+            children_dirs: directories.map((entry) => ({
+              abs_path: stripTrailingPathSeparator(entry),
+              children_dirs: [],
+              children_files: [],
+              num_files: 0,
             })),
-            num_files: entries.length,
+            children_files: files.map((entry) => ({
+              name: listedEntryName(entry),
+            })),
+            num_files: files.length,
           },
         },
       }
@@ -2259,17 +2721,34 @@ export function buildTypedExecResult(
       // a read call returns through mcp_result. Scope the unwrap to toolName
       // "read" so a non-read MCP tool whose output merely contains a
       // "<content>"-like block is never rewritten.
+      if (toolName === "grep" || toolName === "glob") {
+        return {
+          success: {
+            content: [{ text: { text: groundSearchOutput(output, resultRoot) } }],
+            is_error: false,
+          },
+        }
+      }
       if (toolName !== "read") {
         return { success: { content: [{ text: { text: output } }], is_error: false } }
       }
+      const listing = parseOpenCode2DirectoryListing(output, resultRoot)
+      if (listing) {
+        return {
+          success: { content: [{ text: { text: listing.text } }], is_error: false },
+        }
+      }
       // Carry the truncation notice as its own content item: the file content
       // item stays byte-exact, so it can still never be echoed into a write.
-      const notice = readTruncationNotice(output)
+      const notices = [
+        readTruncationNotice(output, resultMetadata),
+        readLongLineTruncationNotice(output),
+      ].filter((notice): notice is string => !!notice)
       return {
         success: {
           content: [
             { text: { text: unwrapReadOutput(output) } },
-            ...(notice ? [{ text: { text: notice } }] : []),
+            ...notices.map((notice) => ({ text: { text: notice } })),
           ],
           is_error: false,
         },
@@ -2338,7 +2817,11 @@ type OpenCodeReadMetadata = {
   startLine?: number
   endLine?: number
   totalLines?: number
+  nextOffset?: number
   outputCapped?: boolean
+  /** OpenCode 2 ended the page before EOF. Distinct from a deliberate offset/limit. */
+  hostTruncated?: boolean
+  truncatedLines?: number[]
 }
 
 /**
@@ -2360,7 +2843,22 @@ function readEnvelopeFooter(output: string): string {
 }
 
 /** Recover full-file metadata before unwrapReadOutput removes OpenCode's footer. */
-function parseOpenCodeReadMetadata(output: string): OpenCodeReadMetadata {
+function parseOpenCodeReadMetadata(
+  output: string,
+  resultMetadata?: Record<string, unknown>,
+): OpenCodeReadMetadata {
+  const opencode2 = parseOpenCode2FileRead(output, resultMetadata)
+  if (opencode2) {
+    return {
+      ...(opencode2.startLine !== undefined ? { startLine: opencode2.startLine } : {}),
+      ...(opencode2.endLine !== undefined ? { endLine: opencode2.endLine } : {}),
+      ...(opencode2.totalLines !== undefined ? { totalLines: opencode2.totalLines } : {}),
+      ...(opencode2.nextOffset !== undefined ? { nextOffset: opencode2.nextOffset } : {}),
+      outputCapped: opencode2.outputCapped,
+      hostTruncated: opencode2.hostTruncated,
+      ...(opencode2.truncatedLines.length > 0 ? { truncatedLines: opencode2.truncatedLines } : {}),
+    }
+  }
   const footer = readEnvelopeFooter(output)
   const showing = /Showing lines (\d+)-(\d+)(?: of (\d+))?\./.exec(footer)
   if (showing) {
@@ -2400,9 +2898,9 @@ function restoreCompleteReadTerminator(
     || content.endsWith("\n")
   ) return content
 
-  const absolute = path.isAbsolute(readPath)
+  const absolute = isAbsoluteToolPath(readPath)
     ? readPath
-    : path.resolve(workspaceRoot ?? process.cwd(), readPath)
+    : joinToolPath(workspaceRoot ?? process.cwd(), readPath)
   let fd: number | undefined
   try {
     fd = fs.openSync(absolute, "r")
@@ -2445,15 +2943,16 @@ function restoreCompleteReadTerminator(
  */
 function readTruncationSummary(
   output: string,
+  resultMetadata?: Record<string, unknown>,
 ): { startLine: number; endLine: number; nextOffset: number; capped: boolean; totalLines?: number } | undefined {
-  const meta = parseOpenCodeReadMetadata(output)
+  const meta = parseOpenCodeReadMetadata(output, resultMetadata)
   if (meta.startLine === undefined || meta.endLine === undefined) return undefined
   // A complete read reports "(End of file …)" and never reaches this shape.
   if (meta.totalLines !== undefined && meta.endLine >= meta.totalLines && !meta.outputCapped) return undefined
   return {
     startLine: meta.startLine,
     endLine: meta.endLine,
-    nextOffset: meta.endLine + 1,
+    nextOffset: meta.nextOffset ?? meta.endLine + 1,
     capped: meta.outputCapped === true,
     ...(meta.totalLines !== undefined ? { totalLines: meta.totalLines } : {}),
   }
@@ -2470,7 +2969,7 @@ function readTruncationNotice(
   output: string,
   resultMetadata?: Record<string, unknown>,
 ): string | undefined {
-  const summary = readTruncationSummary(output)
+  const summary = readTruncationSummary(output, resultMetadata)
   if (!summary) return undefined
   const rangeRequested =
     num(resultMetadata?.offset) !== undefined || num(resultMetadata?.limit) !== undefined
@@ -2487,20 +2986,40 @@ function readTruncationNotice(
   )
 }
 
+function readLongLineTruncationNotice(output: string): string | undefined {
+  const lines = parseOpenCodeReadMetadata(output).truncatedLines
+  if (!lines || lines.length === 0) return undefined
+  const displayed = lines.slice(0, 8).join(", ")
+  const remainder = lines.length > 8 ? ` and ${lines.length - 8} more` : ""
+  return (
+    `[Partial read: OpenCode shortened ${lines.length === 1 ? "line" : "lines"} ` +
+    `${displayed}${remainder} to ${OPENCODE2_READ_MAX_LINE_CHARS} characters. ` +
+    "It is NOT the complete file. Use a byte-preserving read method to inspect the full " +
+    "line content before acting on the whole file; writing the content above back would lose data.]"
+  )
+}
+
 /** agent.v1.PiTruncation for a capped OpenCode read. */
 function readTruncationMessage(
   output: string,
   content: string,
+  resultMetadata?: Record<string, unknown>,
 ): Record<string, unknown> | undefined {
-  const summary = readTruncationSummary(output)
-  if (!summary) return undefined
+  const summary = readTruncationSummary(output, resultMetadata)
+  const longLines = parseOpenCodeReadMetadata(output, resultMetadata).truncatedLines
+  if (!summary && (!longLines || longLines.length === 0)) return undefined
+  const rangeRequested =
+    num(resultMetadata?.offset) !== undefined || num(resultMetadata?.limit) !== undefined
+  if (summary && rangeRequested && !summary.capped && (!longLines || longLines.length === 0)) return undefined
   return {
     truncated: true,
-    truncated_by: summary.capped ? "bytes" : "lines",
-    ...(summary.totalLines !== undefined ? { total_lines: summary.totalLines } : {}),
-    output_lines: Math.max(0, summary.endLine - summary.startLine + 1),
+    truncated_by: summary?.capped ? "bytes" : longLines?.length ? "characters" : "lines",
+    ...(summary?.totalLines !== undefined ? { total_lines: summary.totalLines } : {}),
+    output_lines: summary
+      ? Math.max(0, summary.endLine - summary.startLine + 1)
+      : countLines(content),
     output_bytes: Buffer.byteLength(content, "utf8"),
-    ...(summary.capped ? { max_bytes: OPENCODE_READ_MAX_BYTES } : {}),
+    ...(summary?.capped ? { max_bytes: OPENCODE_READ_MAX_BYTES } : {}),
   }
 }
 
@@ -2524,7 +3043,13 @@ function readOutputTruncated(
   outputMetadata: OpenCodeReadMetadata,
   totalLines: number,
 ): boolean {
+  if (outputMetadata.truncatedLines && outputMetadata.truncatedLines.length > 0) return true
   if (outputMetadata.outputCapped) return true
+  if (outputMetadata.hostTruncated) {
+    const rangeRequested =
+      num(resultMetadata?.offset) !== undefined || num(resultMetadata?.limit) !== undefined
+    if (!rangeRequested) return true
+  }
   const returnedEnd = outputMetadata.endLine
   if (returnedEnd === undefined || totalLines === 0) return false
 
@@ -2536,6 +3061,16 @@ function readOutputTruncated(
     ? totalLines
     : Math.min(totalLines, Math.max(1, startLine) + limit - 1)
   return returnedEnd < expectedEnd
+}
+
+function listedEntryName(entry: string): string {
+  const trimmed = stripTrailingPathSeparator(entry)
+  const slash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"))
+  return slash >= 0 ? trimmed.slice(slash + 1) : trimmed
+}
+
+function stripTrailingPathSeparator(entry: string): string {
+  return entry.endsWith("/") || entry.endsWith("\\") ? entry.slice(0, -1) : entry
 }
 
 function readFileSize(filePath: string): number {

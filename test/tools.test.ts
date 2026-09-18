@@ -30,6 +30,7 @@ import {
   resolveCursorSubagentType,
   REQUEST_CONTEXT_RESULT_FIELD,
   isUriReadTarget,
+  resolveReadTargetPath,
   buildListMcpResourcesFallback,
   buildReadMcpResourceFallback,
   CUSTOM_LIST_MCP_RESOURCES_TOOL,
@@ -1171,6 +1172,16 @@ describe("parseExecServerMessage", () => {
     const parsed = parseExecServerMessage(esm)
     expect(parsed!.toolName).toBe("read")
     expect(parsed!.args).toEqual({ filePath: "/README.md", offset: 1 })
+    expect(parsed!.resultMetadata).toEqual({ path: "/README.md", offset: 1 })
+  })
+
+  it("preserves Pi read ranges for result truncation semantics", () => {
+    const parsed = parseExecServerMessage({
+      id: 12,
+      pi_read_args: { path: "/src/a.ts", offset: 7, limit: 20 },
+    })
+    expect(parsed!.args).toEqual({ filePath: "/src/a.ts", offset: 7, limit: 20 })
+    expect(parsed!.resultMetadata).toEqual({ path: "/src/a.ts", offset: 7, limit: 20 })
   })
 
   it("returns undefined when no exec variant found", () => {
@@ -1240,6 +1251,22 @@ describe("partial-read mutation safety", () => {
     rejectPartialReadMutation(parsed)
 
     expect(parsed.localError).toBeUndefined()
+  })
+
+  it("rejects a whole-file write sourced from a character-truncated line", () => {
+    const shortened = `${"x".repeat(2000)}... (line truncated to 2000 chars)`
+    const read = buildTypedExecResult(
+      "read_result",
+      `Read file /tmp/long.txt, lines 1-1\n1: ${shortened}`,
+    ) as { success: { content: string } }
+    const parsed = parseExecServerMessage({
+      id: 5,
+      write_args: { path: "/tmp/long.txt", file_text: read.success.content },
+    })!
+
+    rejectPartialReadMutation(parsed)
+
+    expect(parsed.localError).toContain("byte-preserving read method")
   })
 })
 
@@ -1384,6 +1411,23 @@ describe("buildExecClientMessages", () => {
     expect(mid.shell_stream?.stdout?.data).toBe("stdout output")
     expect(end.shell_stream?.exit?.code).toBe(0)
     expect(close.exec_client_control_message?.stream_close?.id).toBe(3)
+  })
+
+  it("grounds path-only shell_stream stdout without rewriting structured text", () => {
+    const frames = buildExecClientMessages({
+      execId: 30,
+      resultField: "shell_stream",
+      output: ["src/a.ts:2", '{"path":"src/a.ts"}', "@scope/pkg"].join("\n"),
+      resultMetadata: { working_directory: "pkg" },
+      workspaceRoot: "/workspace/project",
+    })
+    const stdout = decodeMessage<any>("AgentClientMessage", frames[1]).exec_client_message
+      .shell_stream.stdout.data
+    expect(stdout).toBe([
+      "/workspace/project/pkg/src/a.ts:2",
+      '{"path":"src/a.ts"}',
+      "@scope/pkg",
+    ].join("\n"))
   })
 
   it("encodes shell_result success/timeout/failure for exec #2", () => {
@@ -1746,6 +1790,43 @@ describe("unwrapReadOutput", () => {
     expect(unwrapReadOutput("" as string)).toBe("")
     expect(unwrapReadOutput(undefined as unknown as string)).toBe(undefined)
   })
+
+  it("strips an OpenCode 2 file page down to raw lines", () => {
+    const out = [
+      "Read file /abs/file.ts, lines 1-3",
+      "1: import fs from \"node:fs\"",
+      "2: ",
+      "3: const x = 1",
+    ].join("\n")
+    expect(unwrapReadOutput(out)).toBe("import fs from \"node:fs\"\n\nconst x = 1")
+  })
+
+  it("strips an OpenCode 2 truncated page, including its continuation banner", () => {
+    const out = [
+      "Read file src/big.ts, lines 10-11",
+      "10: lineA",
+      "11: lineB",
+      "[Output truncated. Continue reading with offset: 12]",
+    ].join("\n")
+    expect(unwrapReadOutput(out)).toBe("lineA\nlineB")
+  })
+
+  it("returns empty content for an OpenCode 2 empty file", () => {
+    expect(unwrapReadOutput("Read file /abs/empty.ts, 0 lines")).toBe("")
+  })
+
+  it("keeps a file that only quotes an OpenCode 2 header", () => {
+    const out = [
+      "Read file /abs/notes.md, lines 1-1",
+      "1: Read file /abs/other.ts, lines 1-1",
+    ].join("\n")
+    expect(unwrapReadOutput(out)).toBe("Read file /abs/other.ts, lines 1-1")
+  })
+
+  it("leaves a partial OpenCode 2 header unchanged", () => {
+    const out = "Read file /abs/file.ts, lines 1-2\n1: only"
+    expect(unwrapReadOutput(out)).toBe(out)
+  })
 })
 
 describe("buildTypedExecResult read-envelope unwrap", () => {
@@ -1990,6 +2071,688 @@ describe("buildTypedExecResult read-envelope unwrap", () => {
     expect(ec.mcp_result.success.content[0].text.text).toBe(
       "import fs from \"node:fs\"\n\nconst x = 1",
     )
+  })
+})
+
+describe("OpenCode 2 read pages and grounded paths", () => {
+  const truncated = [
+    "Read file src/big.ts, lines 1-2",
+    "1: lineA",
+    "2: lineB",
+    "[Output truncated. Continue reading with offset: 3]",
+  ].join("\n")
+
+  it("marks an unsolicited truncated page and absolutizes its path", () => {
+    const r = buildTypedExecResult(
+      "read_result",
+      truncated,
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      "/workspace/project",
+    ) as { success: { path: string; content: string; truncated: boolean; range_applied: boolean } }
+    expect(r.success.path).toBe("/workspace/project/src/big.ts")
+    expect(r.success.content.startsWith("lineA\nlineB\n\n")).toBe(true)
+    expect(r.success.content).toContain("[Partial read:")
+    expect(r.success.content).toContain("offset=3")
+    expect(r.success.content).not.toContain("50 KB")
+    expect(r.success.content).not.toMatch(/^Read file /)
+    expect(r.success.content).not.toMatch(/^\d+: /m)
+    expect(r.success).toMatchObject({ truncated: true, range_applied: false })
+  })
+
+  it("does not mark a complete OpenCode 2 file", () => {
+    const output = [
+      "Read file src/a.ts, lines 1-2",
+      "1: hello",
+      "2: world",
+    ].join("\n")
+    const r = buildTypedExecResult(
+      "read_result",
+      output,
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      "/workspace/project",
+    ) as { success: { path: string; content: string; truncated: boolean } }
+    expect(r.success.path).toBe("/workspace/project/src/a.ts")
+    expect(r.success.content).toBe("hello\nworld")
+    expect(r.success.truncated).toBe(false)
+  })
+
+  it("does not warn when the caller requested the returned range", () => {
+    const ranged = truncated.replace("src/big.ts", "/abs/big.ts")
+    const r = buildTypedExecResult(
+      "read_result",
+      ranged,
+      undefined,
+      "read",
+      { path: "/abs/big.ts", offset: 1, limit: 2 },
+    ) as { success: { content: string; truncated: boolean; range_applied: boolean } }
+    expect(r.success.content).toBe("lineA\nlineB")
+    expect(r.success).toMatchObject({ truncated: false, range_applied: true })
+  })
+
+  it("names the 50 KB cap when an unsolicited page stopped on the byte budget", () => {
+    const line = "x".repeat(80)
+    const count = 600
+    const output = [
+      `Read file /abs/big.ts, lines 1-${count}`,
+      ...Array.from({ length: count }, (_, index) => `${index + 1}: ${line}`),
+      `[Output truncated. Continue reading with offset: ${count + 1}]`,
+    ].join("\n")
+    const r = buildTypedExecResult("read_result", output, undefined, "read") as {
+      success: { content: string; truncated: boolean }
+    }
+    expect(r.success.truncated).toBe(true)
+    expect(r.success.content).toContain("capped at the host's 50 KB output limit")
+    expect(r.success.content).toContain(`offset=${count + 1}`)
+    expect(r.success.content).not.toMatch(/^\d+: /m)
+  })
+
+  it("keeps the OpenCode 2 notice out of the MCP file-content item", () => {
+    const r = buildTypedExecResult(
+      "mcp_result",
+      truncated,
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      "/workspace/project",
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(r.success.content[0]?.text.text).toBe("lineA\nlineB")
+    expect(r.success.content[1]?.text.text).toContain("[Partial read:")
+    expect(r.success.content[1]?.text.text).toContain("offset=3")
+  })
+
+  it("resolves relative grep headers and drops the trailing colon", () => {
+    const frames = buildExecClientMessages({
+      execId: 1,
+      resultField: "grep_result",
+      output: ["Found 1 matches", "src/foo.ts:", "  Line 1: hi"].join("\n"),
+      workspaceRoot: "/workspace/project",
+    })
+    const ec = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
+    expect(ec.grep_result.success.workspace_results["/workspace/project"].files.files).toEqual([
+      "/workspace/project/src/foo.ts",
+    ])
+  })
+
+  it("joins OpenCode 2 directory entries onto the listed directory", () => {
+    const output = ["Read directory src, entries 1-2", "a.ts", "nested/"].join("\n")
+    const read = buildTypedExecResult(
+      "mcp_result",
+      output,
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      "/workspace/project",
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    const text = read.success.content[0]?.text.text ?? ""
+    expect(text).toContain("Read directory /workspace/project/src, entries 1-2")
+    expect(text).toContain("/workspace/project/src/a.ts")
+    expect(text).toContain(`/workspace/project/src/nested${path.sep}`)
+
+    const frames = buildExecClientMessages({
+      execId: 2,
+      resultField: "ls_result",
+      output,
+      workspaceRoot: "/workspace/project",
+    })
+    const tree = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
+      .ls_result.success.directory_tree_root
+    expect(tree.abs_path).toBe("/workspace/project/src")
+    expect(tree.children_files.map((file: { name: string }) => file.name)).toEqual(["a.ts"])
+    expect(tree.children_dirs).toEqual([{
+      abs_path: "/workspace/project/src/nested",
+      children_dirs: [],
+      children_files: [],
+      num_files: 0,
+    }])
+    expect(tree.num_files).toBe(1)
+  })
+
+  it("absolutizes relative glob lines in MCP text", () => {
+    const r = buildTypedExecResult(
+      "mcp_result",
+      "src/foo.ts\nREADME.md",
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      "/workspace/project",
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(r.success.content[0]?.text.text).toBe(
+      "/workspace/project/src/foo.ts\n/workspace/project/README.md",
+    )
+  })
+})
+
+describe("OpenCode 2 path and read edge cases", () => {
+  const root = "/workspace/project"
+
+  function filePage(filePath: string, lines: string[], nextOffset?: number, start = 1): string {
+    const end = start + lines.length - 1
+    const header = lines.length === 0
+      ? `Read file ${filePath}, 0 lines`
+      : `Read file ${filePath}, lines ${start}-${end}`
+    const body = lines.map((line, index) => `${start + index}: ${line}`)
+    const banner = nextOffset === undefined
+      ? []
+      : [`[Output truncated. Continue reading with offset: ${nextOffset}]`]
+    return [header, ...body, ...banner].join("\n")
+  }
+
+  it("accepts CRLF, a tab after the line number, and a spaced continuation offset", () => {
+    const output = [
+      "Read file src/a.ts, lines 1-2",
+      "1:\thello",
+      "2: world",
+      "[Output truncated. Continue reading with offset:  9]",
+    ].join("\r\n")
+    const r = buildTypedExecResult("read_result", output, undefined, "read", undefined, undefined, root) as {
+      success: { path: string; content: string; truncated: boolean }
+    }
+    expect(r.success.path).toBe(`${root}/src/a.ts`)
+    expect(r.success.content.startsWith("hello\nworld")).toBe(true)
+    expect(r.success.content).toContain("offset=9")
+    expect(r.success.truncated).toBe(true)
+  })
+
+  it("keeps a comma inside the file path", () => {
+    const output = filePage("/tmp/a, b.ts", ["hi"])
+    expect(unwrapReadOutput(output)).toBe("hi")
+    const r = buildTypedExecResult("read_result", output) as { success: { path: string } }
+    expect(r.success.path).toBe("/tmp/a, b.ts")
+  })
+
+  it("marks OpenCode 2's per-line character truncation even at EOF", () => {
+    const shortened = `${"x".repeat(2000)}... (line truncated to 2000 chars)`
+    const output = filePage("/abs/one-line.txt", [shortened])
+    const native = buildTypedExecResult("read_result", output) as {
+      success: { content: string; truncated: boolean }
+    }
+    expect(native.success.truncated).toBe(true)
+    expect(native.success.content).toContain("OpenCode shortened line 1 to 2000 characters")
+    expect(native.success.content).toContain("It is NOT the complete file")
+
+    const mcp = buildTypedExecResult("mcp_result", output, undefined, "read") as {
+      success: { content: Array<{ text: { text: string } }> }
+    }
+    expect(mcp.success.content[0]?.text.text).toBe(shortened)
+    expect(mcp.success.content[1]?.text.text).toContain("byte-preserving read method")
+
+    const pi = buildTypedExecResult("pi_read_result", output) as {
+      success: { truncation: { truncated: boolean; truncated_by: string } }
+    }
+    expect(pi.success.truncation).toMatchObject({ truncated: true, truncated_by: "characters" })
+  })
+
+  it("does not treat a numbered truncation banner as a host cap", () => {
+    const output = filePage("/abs/notes.md", ["[Output truncated. Continue reading with offset: 9]"])
+    const r = buildTypedExecResult("read_result", output) as { success: { content: string; truncated: boolean } }
+    expect(r.success.content).toBe("[Output truncated. Continue reading with offset: 9]")
+    expect(r.success.truncated).toBe(false)
+  })
+
+  it("treats a complete tail page as finished", () => {
+    const output = filePage("/abs/a.ts", ["a", "b"], undefined, 5)
+    const r = buildTypedExecResult("read_result", output, undefined, "read", { path: "/abs/a.ts" }) as {
+      success: { content: string; truncated: boolean; total_lines: number }
+    }
+    expect(r.success.content).toBe("a\nb")
+    expect(r.success).toMatchObject({ truncated: false, total_lines: 6 })
+  })
+
+  it("names 50 KB only when a short page is close enough for the next line not to fit", () => {
+    const underResult = buildTypedExecResult("read_result", filePage("/abs/a.ts", ["short"], 2)) as {
+      success: { content: string }
+    }
+    expect(underResult.success.content).toContain("[Partial read:")
+    expect(underResult.success.content).not.toContain("50 KB")
+
+    // Seven maximum-width three-byte lines plus two ASCII lines fit, while one
+    // more maximum-width line would exceed OpenCode 2's 50 KiB page budget.
+    const cappedLines = [
+      ...Array.from({ length: 7 }, () => "€".repeat(2000)),
+      ...Array.from({ length: 2 }, () => "x".repeat(2000)),
+    ]
+    const cappedResult = buildTypedExecResult(
+      "read_result",
+      filePage("/abs/a.ts", cappedLines, cappedLines.length + 1),
+      undefined,
+      "read",
+      { offset: 1, limit: 20 },
+    ) as { success: { content: string; truncated: boolean } }
+    expect(cappedResult.success.truncated).toBe(true)
+    expect(cappedResult.success.content).toContain("50 KB")
+  })
+
+  it("does not warn when a requested range hits the 2,000-line stop exactly", () => {
+    const lines = Array.from({ length: 2000 }, () => "x")
+    const r = buildTypedExecResult(
+      "read_result",
+      filePage("/abs/a.ts", lines, 2001),
+      undefined,
+      "read",
+      { offset: 1, limit: 2000 },
+    ) as { success: { content: string; truncated: boolean } }
+    expect(r.success.content).toBe(lines.join("\n"))
+    expect(r.success.truncated).toBe(false)
+  })
+
+  it("warns on an unsolicited 2,000-line stop without calling it a byte cap", () => {
+    const lines = Array.from({ length: 2000 }, () => "x")
+    const r = buildTypedExecResult("read_result", filePage("/abs/a.ts", lines, 2001)) as {
+      success: { content: string; truncated: boolean }
+    }
+    expect(r.success.truncated).toBe(true)
+    expect(r.success.content).toContain("[Partial read:")
+    expect(r.success.content).toContain("offset=2001")
+    expect(r.success.content).not.toContain("50 KB")
+  })
+
+  it("honors offset metadata on an MCP read", () => {
+    const output = filePage("/abs/a.ts", ["a", "b"], 3)
+    const r = buildTypedExecResult(
+      "mcp_result",
+      output,
+      undefined,
+      "read",
+      { offset: 1, limit: 2 },
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(r.success.content).toHaveLength(1)
+    expect(r.success.content[0]?.text.text).toBe("a\nb")
+  })
+
+  it("absolutizes a relative read error path", () => {
+    const r = buildTypedExecResult(
+      "read_result",
+      "",
+      "missing",
+      "read",
+      { path: "src/a.ts" },
+      undefined,
+      root,
+    ) as { error: { path: string; error: string } }
+    expect(r.error).toEqual({ path: `${root}/src/a.ts`, error: "missing" })
+  })
+
+  it("resolves directory entries, keeps markers, and leaves unknown listings alone", () => {
+    const listed = buildTypedExecResult(
+      "mcp_result",
+      ["Read directory src, entries 1-4", "./a.ts", "../b.ts", "nested/", "~/keep.ts"].join("\n"),
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    const text = listed.success.content[0]?.text.text ?? ""
+    expect(text).toContain(`${root}/src/a.ts`)
+    expect(text).toContain(`${root}/b.ts`)
+    expect(text).toContain(`${root}/src/nested${path.sep}`)
+    expect(text).toContain("~/keep.ts")
+
+    const empty = buildTypedExecResult(
+      "read_result",
+      "Read directory src, 0 entries",
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { path: string; content: string } }
+    expect(empty.success.path).toBe(`${root}/src`)
+    expect(empty.success.content).toBe(`Read directory ${root}/src, 0 entries`)
+
+    const untouched = buildTypedExecResult(
+      "mcp_result",
+      "Read directory src, entries 1-1\na.ts",
+      undefined,
+      "read",
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(untouched.success.content[0]?.text.text).toBe("Read directory src, entries 1-1\na.ts")
+  })
+
+  it("keeps grep match previews and URLs out of the file list", () => {
+    const frames = buildExecClientMessages({
+      execId: 1,
+      resultField: "grep_result",
+      output: [
+        "Found 1 matches (more matches available)",
+        "/workspace/project/src/a.ts:",
+        "  Line 1: see src/b.ts",
+        "https://example.com/a:",
+        "",
+        "(Results are truncated. Consider using a more specific path or pattern.)",
+      ].join("\n"),
+      workspaceRoot: root,
+    })
+    const files = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
+      .grep_result.success.workspace_results[root].files.files
+    expect(files).toEqual([`${root}/src/a.ts`])
+
+    const none = buildExecClientMessages({
+      execId: 2,
+      resultField: "grep_result",
+      output: "No matches found",
+      workspaceRoot: root,
+    })
+    const empty = decodeMessage<any>("AgentClientMessage", none[0]).exec_client_message
+      .grep_result.success.workspace_results[root].files.files
+    expect(empty).toEqual([])
+  })
+
+  it("rewrites glob paths and leaves the truncation footer", () => {
+    const r = buildTypedExecResult(
+      "mcp_result",
+      ["src/a.ts", "~/keep.ts", "(Results are truncated: showing first 1 results. Consider using a more specific path or pattern.)"].join("\n"),
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(r.success.content[0]?.text.text).toBe(
+      [
+        `${root}/src/a.ts`,
+        "~/keep.ts",
+        "(Results are truncated: showing first 1 results. Consider using a more specific path or pattern.)",
+      ].join("\n"),
+    )
+  })
+
+  it("rewrites shell path tokens against the working directory and leaves prose", () => {
+    const stdout = [
+      "src/a.ts",
+      "built src/a.ts ok",
+      "https://example.com/a",
+      "/abs/b.ts",
+      "src/c.ts:12:3",
+      "~/secret",
+    ].join("\n")
+    const r = buildTypedExecResult(
+      "shell_result",
+      stdout,
+      undefined,
+      "bash",
+      { command: "ls", working_directory: "pkg" },
+      undefined,
+      root,
+    ) as { success: { stdout: string } }
+    expect(r.success.stdout).toBe(
+      [
+        `${root}/pkg/src/a.ts`,
+        "built src/a.ts ok",
+        "https://example.com/a",
+        "/abs/b.ts",
+        `${root}/pkg/src/c.ts:12:3`,
+        "~/secret",
+      ].join("\n"),
+    )
+
+    const pi = buildTypedExecResult("pi_bash_result", "src/a.ts", undefined, "bash", undefined, undefined, root) as {
+      success: { output: string }
+    }
+    expect(pi.success.output).toBe(`${root}/src/a.ts`)
+    const edit = buildTypedExecResult("pi_edit_result", "src/a.ts", undefined, "edit", undefined, undefined, root) as {
+      success: { output: string }
+    }
+    expect(edit.success.output).toBe("src/a.ts")
+  })
+
+  it("leaves a broken OpenCode 2 page unchanged, including a byte-order mark on a valid one", () => {
+    const broken = "Read file src/a.ts, lines 1-2\n1: only\n"
+    expect(unwrapReadOutput(broken)).toBe(broken)
+    const kept = buildTypedExecResult("read_result", broken, undefined, "read", undefined, undefined, root) as {
+      success: { content: string; truncated: boolean }
+    }
+    expect(kept.success.content).toBe(broken)
+    expect(kept.success.truncated).toBe(false)
+
+    expect(unwrapReadOutput(`\uFEFF${filePage("/abs/a.ts", ["hi"])}`)).toBe("hi")
+  })
+
+  it("absolutizes an empty relative file and prefers metadata over the header path", () => {
+    const empty = buildTypedExecResult(
+      "read_result",
+      "Read file src/empty.ts, 0 lines",
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { path: string; content: string; truncated: boolean } }
+    expect(empty.success).toMatchObject({
+      path: `${root}/src/empty.ts`,
+      content: "",
+      truncated: false,
+    })
+
+    const preferred = buildTypedExecResult(
+      "read_result",
+      filePage("src/other.ts", ["hi"]),
+      undefined,
+      "read",
+      { path: "src/a.ts" },
+      undefined,
+      `${root}/`,
+    ) as { success: { path: string; content: string } }
+    expect(preferred.success.path).toBe(`${root}/src/a.ts`)
+    expect(preferred.success.content).toBe("hi")
+  })
+
+  it("uses the host-reported path for file metadata and newline recovery", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-oc2-read-path-"))
+    const actual = path.join(dir, "actual.txt")
+    fs.writeFileSync(actual, "hello\n")
+    try {
+      const result = buildTypedExecResult(
+        "read_result",
+        filePage(actual, ["hello"]),
+        undefined,
+        "read",
+        { path: path.join(dir, "requested.txt") },
+      ) as { success: { path: string; content: string; file_size: number } }
+      expect(result.success).toMatchObject({
+        path: path.join(dir, "requested.txt"),
+        content: "hello\n",
+        file_size: 6,
+      })
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("keeps a directory banner, foreign absolute entries, and refuses a blank-line listing", () => {
+    const listed = buildTypedExecResult(
+      "mcp_result",
+      [
+        "Read directory src, entries 1-3",
+        "a.ts",
+        "C:/Windows/a.ts",
+        "\\\\server\\share\\b.ts",
+        "[Output truncated. Continue reading with offset: 4]",
+      ].join("\n"),
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(listed.success.content[0]?.text.text).toBe(
+      [
+        `Read directory ${root}/src, entries 1-3`,
+        `${root}/src/a.ts`,
+        "C:/Windows/a.ts",
+        "\\\\server\\share\\b.ts",
+        "[Output truncated. Continue reading with offset: 4]",
+      ].join("\n"),
+    )
+
+    const broken = "Read directory src, entries 1-2\na.ts\n\nb.ts"
+    const untouched = buildTypedExecResult(
+      "mcp_result",
+      broken,
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(untouched.success.content[0]?.text.text).toBe(broken)
+  })
+
+  it("absolutizes relative grep headers in both text and the file list", () => {
+    const output = ["Found 1 matches", "src/a.ts:", "  Line 2: hi", "C:/keep.ts:"].join("\n")
+    const text = buildTypedExecResult(
+      "mcp_result",
+      output,
+      undefined,
+      "grep",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(text.success.content[0]?.text.text).toBe(
+      ["Found 1 matches", `${root}/src/a.ts:`, "  Line 2: hi", "C:/keep.ts:"].join("\n"),
+    )
+
+    const frames = buildExecClientMessages({
+      execId: 3,
+      resultField: "grep_result",
+      output,
+      workspaceRoot: root,
+    })
+    const files = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
+      .grep_result.success.workspace_results[root].files.files
+    expect(files).toEqual([`${root}/src/a.ts`, "C:/keep.ts"])
+  })
+
+  it("leaves an empty glob and a Pi read's truncation flag accurate", () => {
+    const none = buildTypedExecResult(
+      "mcp_result",
+      "No files found",
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(none.success.content[0]?.text.text).toBe("No files found")
+
+    const partial = buildTypedExecResult("pi_read_result", filePage("/abs/a.ts", ["a"], 2)) as {
+      success: { output: string; truncation: { truncated: boolean; truncated_by: string } }
+    }
+    expect(partial.success.output).toBe("a")
+    expect(partial.success.truncation).toMatchObject({ truncated: true, truncated_by: "lines" })
+
+    const requested = buildTypedExecResult(
+      "pi_read_result",
+      filePage("/abs/a.ts", ["a"], 2),
+      undefined,
+      "read",
+      { offset: 1, limit: 1 },
+    ) as { success: { truncation?: unknown } }
+    expect(requested.success.truncation).toBeUndefined()
+
+    const whole = buildTypedExecResult("pi_read_result", filePage("/abs/a.ts", ["a"])) as {
+      success: { output: string; truncation?: unknown }
+    }
+    expect(whole.success.output).toBe("a")
+    expect(whole.success.truncation).toBeUndefined()
+  })
+
+  it("does not rewrite shell prose, bare names, or foreign absolute paths", () => {
+    const stdout = ["README.md", "ok", "C:/src/a.ts", "C:/src/a.ts:12", "./src/b.ts"].join("\n")
+    const r = buildTypedExecResult(
+      "shell_result",
+      stdout,
+      undefined,
+      "bash",
+      { command: "ls", working_directory: "/tmp/work" },
+      undefined,
+      root,
+    ) as { success: { stdout: string } }
+    expect(r.success.stdout).toBe(
+      ["README.md", "ok", "C:/src/a.ts", "C:/src/a.ts:12", "/tmp/work/src/b.ts"].join("\n"),
+    )
+
+    const failed = buildTypedExecResult(
+      "shell_result",
+      "src/a.ts",
+      "nope",
+      "bash",
+      { command: "ls", working_directory: "/tmp/work" },
+      undefined,
+      root,
+    ) as { failure: { stdout: string; stderr: string } }
+    expect(failed.failure).toMatchObject({ stdout: "/tmp/work/src/a.ts", stderr: "nope" })
+
+    const unrooted = buildTypedExecResult("shell_result", "src/a.ts") as { success: { stdout: string } }
+    expect(unrooted.success.stdout).toBe("src/a.ts")
+  })
+
+  it("joins onto Windows directory headers and working directories without a second prefix", () => {
+    const listed = buildTypedExecResult(
+      "mcp_result",
+      ["Read directory C:/proj, entries 1-3", "a.ts", "nested/", "../b.ts"].join("\n"),
+      undefined,
+      "read",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(listed.success.content[0]?.text.text).toBe(
+      ["Read directory C:/proj, entries 1-3", "C:/proj/a.ts", "C:/proj/nested/", "C:/b.ts"].join("\n"),
+    )
+
+    const backslash = buildTypedExecResult(
+      "mcp_result",
+      ["Read directory C:\\proj, entries 1-1", "a.ts"].join("\n"),
+      undefined,
+      "read",
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(backslash.success.content[0]?.text.text).toBe(
+      ["Read directory C:\\proj, entries 1-1", "C:\\proj\\a.ts"].join("\n"),
+    )
+
+    const unc = buildTypedExecResult(
+      "mcp_result",
+      ["Read directory \\\\server\\share, entries 1-1", "a.ts"].join("\n"),
+      undefined,
+      "read",
+    ) as { success: { content: Array<{ text: { text: string } }> } }
+    expect(unc.success.content[0]?.text.text).toBe(
+      ["Read directory \\\\server\\share, entries 1-1", "\\\\server\\share\\a.ts"].join("\n"),
+    )
+
+    const frames = buildExecClientMessages({
+      execId: 4,
+      resultField: "ls_result",
+      output: ["Read directory C:/proj, entries 1-2", "a.ts", "nested/"].join("\n"),
+      workspaceRoot: root,
+    })
+    const tree = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
+      .ls_result.success.directory_tree_root
+    expect(tree.abs_path).toBe("C:/proj")
+    expect(tree.children_files.map((file: { name: string }) => file.name)).toEqual(["a.ts"])
+    expect(tree.children_dirs[0]?.abs_path).toBe("C:/proj/nested")
+
+    const shell = buildTypedExecResult(
+      "shell_result",
+      "./src/b.ts",
+      undefined,
+      "bash",
+      { command: "ls", working_directory: "C:/work" },
+      undefined,
+      root,
+    ) as { success: { stdout: string } }
+    expect(shell.success.stdout).toBe("C:/work/src/b.ts")
   })
 })
 
@@ -2247,5 +3010,12 @@ describe("isUriReadTarget", () => {
     ]) {
       expect(isUriReadTarget(target), target).toBe(false)
     }
+  })
+
+  it("does not prefix a Windows read target with the workspace", () => {
+    expect(resolveReadTargetPath("C:/Users/me/file.ts", "/workspace/project")).toBe("C:/Users/me/file.ts")
+    expect(resolveReadTargetPath("C:\\Users\\me\\file.ts", "/workspace/project")).toBe("C:\\Users\\me\\file.ts")
+    expect(resolveReadTargetPath("\\\\server\\share\\b.ts", "/workspace/project")).toBe("\\\\server\\share\\b.ts")
+    expect(resolveReadTargetPath("src/a.ts", "/workspace/project")).toBe("/workspace/project/src/a.ts")
   })
 })
