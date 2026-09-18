@@ -25,6 +25,7 @@ import {
   extractHostSubagentCatalog,
   mapCursorSubagentTypeToOpenCode,
   remapNativeSubagentForCatalog,
+  preferCorrelatedTaskDescription,
   rejectPartialReadMutation,
   resolveCursorSubagentType,
   REQUEST_CONTEXT_RESULT_FIELD,
@@ -585,6 +586,7 @@ describe("parseExecServerMessage", () => {
       toolName: "task",
       resultField: "subagent_result",
       args: {
+        // SubagentArgs has no description field; fallback is first 5 prompt words.
         description: "Inspect recent logs and identify",
         prompt: "Inspect recent logs and identify the root cause",
         subagent_type: "general",
@@ -593,6 +595,19 @@ describe("parseExecServerMessage", () => {
       },
     })
     expect(result?.localError).toBeUndefined()
+  })
+
+  it("prefers Cursor TaskToolCall description over the 5-word prompt fallback", () => {
+    const esm = decodeMessage<any>("ExecServerMessage", canonicalSubagentExecMessage())
+    const result = parseExecServerMessage(esm)!
+    expect(result.args.description).toBe("Inspect recent logs and identify")
+
+    preferCorrelatedTaskDescription(result, "Find auth root cause")
+    expect(result.args.description).toBe("Find auth root cause")
+
+    // Empty / whitespace must not wipe the existing fallback title.
+    preferCorrelatedTaskDescription(result, "   ")
+    expect(result.args.description).toBe("Find auth root cause")
   })
 
   it("decodes canonical field #16 with a self-contained background fallback", () => {

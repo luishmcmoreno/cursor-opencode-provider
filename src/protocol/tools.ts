@@ -1346,10 +1346,31 @@ function num(v: unknown): number | undefined {
   return undefined
 }
 
+/**
+ * Fallback OpenCode task title when Cursor's SubagentArgs has no description.
+ * Prefer {@link preferCorrelatedTaskDescription} when a TaskToolCall is available —
+ * that carries Cursor's real 3–5 word title. This only slices the prompt.
+ */
 function describeSubagentTask(prompt?: string, subagentType?: string): string {
   const words = prompt?.replace(/\s+/g, " ").trim().split(" ").filter(Boolean).slice(0, 5)
   if (words?.length) return words.join(" ")
   return `${subagentType || "Delegated"} task`
+}
+
+/**
+ * Replace the prompt-derived task title with Cursor's TaskToolCall description
+ * when the display call is correlated via tool_call_id. SubagentArgs itself has
+ * no description field, so without this OpenCode shows a cut-off first-five-words
+ * slice of the prompt.
+ */
+export function preferCorrelatedTaskDescription(
+  parsed: ParsedExecRequest,
+  description: string | undefined,
+): void {
+  if (parsed.toolName !== "task" || parsed.resultField !== "subagent_result") return
+  const trimmed = description?.trim()
+  if (!trimmed) return
+  parsed.args.description = trimmed
 }
 
 function shellQuote(s: string): string {

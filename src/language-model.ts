@@ -32,6 +32,7 @@ import {
   extractHostSubagentCatalog,
   resolveCustomWebToolAlias,
   remapNativeSubagentForCatalog,
+  preferCorrelatedTaskDescription,
   remapCorrelatedEditWriteForCatalog,
   remapEditToolsForCatalog,
   buildCompleteEditReadMessages,
@@ -2728,6 +2729,23 @@ export async function pump(
             parsed.toolName = executableToolName
           }
           remapNativeSubagentForCatalog(parsed, advertisedToolNameSet, session.subagentCatalog)
+          // SubagentArgs has no description; Cursor's real title lives on the
+          // correlated display TaskToolCall. Prefer that over the 5-word prompt slice.
+          if (displayCallId && parsed.toolName === "task") {
+            const stored = session.displayToolCalls.get(displayCallId)
+            const display = parseDisplayToolCall(displayCallId, stored)
+            if (display?.variant === "task_tool_call") {
+              const description =
+                typeof display.args.description === "string" ? display.args.description : undefined
+              preferCorrelatedTaskDescription(parsed, description)
+              if (description?.trim()) {
+                trace(
+                  `exec: preferred TaskToolCall description callId=${displayCallId} ` +
+                    `description=${JSON.stringify(description.trim())}`,
+                )
+              }
+            }
+          }
           const editCall = displayCallId
             ? session.editToolCalls?.get(displayCallId)
             : undefined

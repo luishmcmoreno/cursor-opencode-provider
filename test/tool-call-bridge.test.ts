@@ -345,6 +345,33 @@ describe("tool-call-bridge", () => {
     expect(resolveBridgedOpenCodeToolCall(missingSubtype!, ["task"])).toBeUndefined()
   })
 
+  it("keeps TaskToolCall description intact for SubagentArgs correlation", () => {
+    // Display TaskToolCall is not mirrored into OpenCode (exec #28 owns execution),
+    // but its description is the real short title Cursor generated. SubagentArgs
+    // has no description field, so language-model prefers this when tool_call_id matches.
+    const display = parseDisplayToolCall("task-call-34", {
+      task_tool_call: {
+        args: {
+          description: "Find auth root cause",
+          prompt: "Inspect recent logs and identify the root cause",
+          subagent_type: { explore: {} },
+        },
+      },
+    })
+    expect(display).toMatchObject({
+      variant: "task_tool_call",
+      preferredToolName: "task",
+      args: {
+        description: "Find auth root cause",
+        prompt: "Inspect recent logs and identify the root cause",
+        subagent_type: "explore",
+      },
+    })
+    expect(extractExecDisplayCallId({
+      subagent_args: { tool_call_id: "task-call-34", prompt: "Inspect recent logs and identify the root cause" },
+    })).toBe("task-call-34")
+  })
+
   it("does not substitute a search term for a fetch URL", () => {
     const search = parseDisplayToolCall("search", {
       web_search_tool_call: { args: { search_term: "OpenCode" } },
