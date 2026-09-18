@@ -19,6 +19,11 @@ import {
   sanitizeRegisteredCursorShellOutput,
 } from "./shell-timeout.js"
 import { applyCursorModels, applyCursorProvider } from "./opencode2/catalog.js"
+import {
+  hasCatalogDomain,
+  stableModelsPublished,
+  syncCursorProvidersConfigAndReload,
+} from "./opencode2/config-catalog.js"
 import { applyCursorIntegration, resolveCursorAccessToken } from "./opencode2/integration.js"
 import { markCompactionSession } from "./compaction-marker.js"
 import { markSessionDirectory } from "./session-directory.js"
@@ -27,14 +32,22 @@ import type { CreateCursorOptions } from "./index.js"
 import type { Cleanup, PluginContext, Plugin2 } from "./opencode2/types.js"
 
 /**
- * OpenCode 2.0 beta plugin.
+ * OpenCode 2.0 plugin (beta catalog API + stable 2.0.5 compat).
  *
  * Separate from `plugin-v2.ts` on purpose: the OpenCode 1.18 `/v2/promise` API
  * and the 2.0 API are source-incompatible (hook signatures, OAuth value type,
  * provider schema), so they cannot share an entrypoint. Shared behavior lives in
  * `plugin-core.ts`, `model-config.ts`, and `opencode2/*`.
  *
- * Load with:  { "plugins": ["cursor-opencode-provider/plugin/opencode2"] }
+ * Host matrix:
+ * - OC2 **beta** with `ctx.catalog` → register provider/models via catalog.transform
+ * - OC2 **stable 2.0.5** (no catalog) → auth + aisdk hooks still run; models are
+ *   synced into user config `providers.cursor` (see `config-catalog.ts`)
+ * - OC1 → use classic `./plugin` or `./plugin/v2`, not this entry
+ *
+ * Load with:  { "plugin": ["cursor-opencode-provider/plugin/opencode2"] }
+ * or a local package directory under `$OPENCODE_CONFIG_DIR/plugins/` that
+ * re-exports `dist/plugin-opencode2.js` (stable 2.0.x requires a directory, not a .js path).
  */
 
 async function loadModels(cacheDir: string, accessToken: string | undefined): Promise<ModelInfo[]> {
@@ -76,6 +89,8 @@ const plugin: Plugin2 = {
     }
 
     let models: ModelInfo[] = []
+    const useCatalog = hasCatalogDomain(ctx)
+    let stableReloadPending = false
 
     // ── Credentials ──────────────────────────────────────────────────────────
     await track(ctx.integration.transform(applyCursorIntegration))
@@ -100,15 +115,58 @@ const plugin: Plugin2 = {
       return token
     }
 
-    // ── Catalog ──────────────────────────────────────────────────────────────
-    // Runs now with whatever models we have (likely none) and is replayed by the
-    // host on every `catalog.reload()`, so the async fill below just re-triggers it.
-    await track(
-      ctx.catalog.transform((draft) => {
-        applyCursorProvider(draft)
-        applyCursorModels(draft, models)
-      }),
-    )
+    // ── Catalog (beta) or config providers sync (stable 2.0.5) ───────────────
+    // Beta: transform replays on catalog.reload().
+    // Stable: no ctx.catalog — persist providers.cursor into the host config dir.
+    if (useCatalog && ctx.catalog) {
+      await track(
+        ctx.catalog.transform((draft) => {
+          applyCursorProvider(draft)
+          applyCursorModels(draft, models)
+        }),
+      )
+    } else {
+      // Seed from disk cache so picker is non-empty before /connect on repeat runs.
+      // Do not write an empty providers.cursor block (would clobber a good config).
+      try {
+        const cached = await readCache(cacheDir)
+        if (cached?.models?.length) {
+          models = cached.models
+          const seeded = await syncCursorProvidersConfigAndReload(models, {
+            provider: () => ctx.provider?.reload?.(),
+            model: () => ctx.model?.reload?.(),
+          })
+          if (!stableModelsPublished(seeded)) stableReloadPending = true
+        }
+      } catch {
+        stableReloadPending = true
+        // Config write is best-effort; auth/aisdk still work without it.
+      }
+    }
+
+    const publishModels = async (next: ModelInfo[]): Promise<boolean> => {
+      models = next
+      if (useCatalog && ctx.catalog) {
+        await ctx.catalog.reload().catch(() => {})
+        return true
+      }
+      try {
+        const result = await syncCursorProvidersConfigAndReload(next, {
+          provider: () => ctx.provider?.reload?.(),
+          model: () => ctx.model?.reload?.(),
+        }, { forceReload: stableReloadPending })
+        if (!stableModelsPublished(result)) {
+          stableReloadPending = true
+          return false
+        }
+        stableReloadPending = false
+        return true
+      } catch {
+        // Leave model loading retryable; auth/aisdk remain usable.
+        stableReloadPending = true
+        return false
+      }
+    }
 
     // ── AI SDK wiring ────────────────────────────────────────────────────────
     await track(
@@ -290,10 +348,8 @@ const plugin: Plugin2 = {
           const token = await accessToken()
           const discovered = await loadModels(cacheDir, token)
           if (!discovered.length) return
-          models = discovered
+          if (!await publishModels(discovered)) return
           modelsLoaded = true
-          // Replays the catalog transform above, this time with models.
-          await ctx.catalog.reload().catch(() => {})
           if (token) {
             // Resolve the region-specific Run origin so the first turn doesn't
             // pay for GetServerConfig. Best effort: startSession surfaces real
