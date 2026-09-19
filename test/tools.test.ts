@@ -1019,6 +1019,7 @@ describe("parseExecServerMessage", () => {
     expect(result!.toolName).toBe("grep")
     expect(result!.args).toEqual({ pattern: "foo", path: "/src" })
     expect(result!.resultField).toBe("grep_result")
+    expect(result!.resultMetadata).toEqual({ pattern: "foo", path: "/src" })
   })
 
   it("parses empty-pattern grep_args as glob (live Grep loop regression)", () => {
@@ -2175,8 +2176,12 @@ describe("OpenCode 2 read pages and grounded paths", () => {
       workspaceRoot: "/workspace/project",
     })
     const ec = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
-    expect(ec.grep_result.success.workspace_results["/workspace/project"].files.files).toEqual([
-      "/workspace/project/src/foo.ts",
+    expect(ec.grep_result.success.output_mode).toBe("content")
+    expect(ec.grep_result.success.workspace_results["/workspace/project"].content.matches).toEqual([
+      {
+        file: "/workspace/project/src/foo.ts",
+        matches: [{ line_number: 1, content: "hi" }],
+      },
     ])
   })
 
@@ -2432,9 +2437,39 @@ describe("OpenCode 2 path and read edge cases", () => {
       ].join("\n"),
       workspaceRoot: root,
     })
-    const files = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
-      .grep_result.success.workspace_results[root].files.files
-    expect(files).toEqual([`${root}/src/a.ts`])
+    const content = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
+      .grep_result.success
+    expect(content.output_mode).toBe("content")
+    expect(content.workspace_results[root].content.matches).toEqual([
+      {
+        file: `${root}/src/a.ts`,
+        matches: [{ line_number: 1, content: "see src/b.ts" }],
+      },
+    ])
+    expect(content.workspace_results[root].content.client_truncated).toBe(true)
+    expect(JSON.stringify(content)).not.toContain("https://example.com")
+
+    const filesOnly = buildExecClientMessages({
+      execId: 3,
+      resultField: "grep_result",
+      output: [
+        "Found 100 matches (more matches available)",
+        "src/a.ts:",
+        "  Line 4: secret",
+        "",
+        "(Results are truncated. Consider using a more specific path or pattern.)",
+      ].join("\n"),
+      resultMetadata: { pattern: "secret", path: "src", output_mode: "files_with_matches" },
+      workspaceRoot: root,
+    })
+    const listed = decodeMessage<any>("AgentClientMessage", filesOnly[0]).exec_client_message
+      .grep_result.success
+    expect(listed.output_mode).toBe("files_with_matches")
+    expect(listed.pattern).toBe("secret")
+    expect(listed.path).toBe("src")
+    expect(listed.workspace_results[root].files.files).toEqual([`${root}/src/a.ts`])
+    expect(listed.workspace_results[root].files.client_truncated).toBe(true)
+    expect(listed.workspace_results[root].content).toBeUndefined()
 
     const none = buildExecClientMessages({
       execId: 2,
@@ -2628,9 +2663,11 @@ describe("OpenCode 2 path and read edge cases", () => {
       output,
       workspaceRoot: root,
     })
-    const files = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
-      .grep_result.success.workspace_results[root].files.files
-    expect(files).toEqual([`${root}/src/a.ts`, "C:/keep.ts"])
+    const matches = decodeMessage<any>("AgentClientMessage", frames[0]).exec_client_message
+      .grep_result.success.workspace_results[root].content.matches
+    expect(matches).toEqual([
+      { file: `${root}/src/a.ts`, matches: [{ line_number: 2, content: "hi" }] },
+    ])
   })
 
   it("leaves an empty glob and a Pi read's truncation flag accurate", () => {

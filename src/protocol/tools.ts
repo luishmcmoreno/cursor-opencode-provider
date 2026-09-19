@@ -1236,7 +1236,9 @@ export function parseExecServerMessage(
     ? shellStreamResultMetadata(rawArgs)
     : execVariant === "read_args" || execVariant === "pi_read_args"
       ? readRequestResultMetadata(rawArgs, mapped.args)
-      : undefined
+      : execVariant === "grep_args"
+        ? grepRequestResultMetadata(rawArgs)
+        : undefined
   if (
     resultMetadata
     && resultMetadata.timeout_behavior !== 2
@@ -2359,6 +2361,76 @@ function rewriteShellPathLine(line: string, root: string): string {
   return line
 }
 
+type ParsedGrepContent = {
+  matches: Array<{
+    file: string
+    matches: Array<{ line_number: number; content: string }>
+  }>
+  truncated: boolean
+  totalMatchedLines: number
+}
+
+const OPENCODE_GREP_LINE = /^[ \t]+Line (\d+):[ \t]?(.*)$/
+
+/**
+ * OpenCode 1.x and 2.0 both render grep as `Found N matches`, a `path:` header,
+ * and indented `Line N: text` previews. A page with no previews is not content.
+ */
+function parseOpenCodeGrepContent(
+  output: string,
+  workspaceRoot: string | undefined,
+): ParsedGrepContent | undefined {
+  const lines = normalizeToolText(output).split("\n")
+  const first = lines[0]?.trim() ?? ""
+  if (!/^Found \d+ matches\b/.test(first)) return undefined
+
+  const matches: ParsedGrepContent["matches"] = []
+  let current: ParsedGrepContent["matches"][number] | undefined
+  let truncated = /\bmore matches available\b/.test(first)
+  let sawLine = false
+  for (const raw of lines.slice(1)) {
+    if (!raw.trim()) continue
+    const preview = OPENCODE_GREP_LINE.exec(raw)
+    if (preview) {
+      sawLine = true
+      if (!current) continue
+      const lineNumber = Number(preview[1])
+      if (!Number.isSafeInteger(lineNumber) || lineNumber < 1) continue
+      current.matches.push({ line_number: lineNumber, content: preview[2] ?? "" })
+      continue
+    }
+    if (raw.trimStart().startsWith("(")) {
+      if (/truncat/i.test(raw)) truncated = true
+      continue
+    }
+    if (raw.startsWith(" ") || raw.startsWith("\t")) continue
+    const header = /^(.*):$/.exec(raw.trim())
+    if (!header || !header[1] || header[1].includes("://")) continue
+    current = { file: resolveToolPath(header[1], workspaceRoot), matches: [] }
+    matches.push(current)
+  }
+  if (!sawLine) return undefined
+  const withHits = matches.filter((file) => file.matches.length > 0)
+  if (withHits.length === 0) return undefined
+  return {
+    matches: withHits,
+    truncated,
+    totalMatchedLines: withHits.reduce((count, file) => count + file.matches.length, 0),
+  }
+}
+
+function grepRequestResultMetadata(raw: Record<string, unknown>): Record<string, unknown> | undefined {
+  const pattern = str(raw.pattern)
+  const outputMode = str(raw.output_mode)
+  const searchPath = str(raw.path)
+  if (!pattern && !outputMode && !searchPath) return undefined
+  return {
+    ...(pattern ? { pattern } : {}),
+    ...(outputMode ? { output_mode: outputMode } : {}),
+    ...(searchPath ? { path: searchPath } : {}),
+  }
+}
+
 function extractGroundedPaths(output: string, workspaceRoot: string | undefined): string[] {
   const normalized = normalizeToolText(output)
   const directory = parseOpenCode2DirectoryListing(normalized, workspaceRoot)
@@ -2536,21 +2608,50 @@ export function buildTypedExecResult(
     }
     case "grep_result": {
       if (error) return { error: { error } }
-      // Prefer files_with_matches: OpenCode glob/grep often returns path lists.
-      // Content-mode GrepSuccess also works but needs GrepFileMatch nesting.
-      const files = extractGroundedPaths(output, resultRoot)
       const cwd = resultRoot ?? ""
+      const pattern = str(resultMetadata?.pattern) ?? ""
+      const requestedPath = str(resultMetadata?.path) ?? cwd
+      const requestedMode = str(resultMetadata?.output_mode)
+      // OpenCode always returns match previews. Cursor's native Grep defaults
+      // to content; encoding that as files_with_matches drops the previews and
+      // the model only sees paths. Keep files_with_matches for an explicit
+      // files-only request, and for path lists (glob remaps, no matches).
+      const parsedContent = parseOpenCodeGrepContent(output, resultRoot)
+      const content = requestedMode === "files_with_matches"
+        ? undefined
+        : parsedContent
+      if (content) {
+        return {
+          success: {
+            pattern,
+            path: requestedPath,
+            output_mode: "content",
+            workspace_results: {
+              [cwd]: {
+                content: {
+                  matches: content.matches,
+                  total_lines: content.totalMatchedLines,
+                  total_matched_lines: content.totalMatchedLines,
+                  client_truncated: content.truncated,
+                  ripgrep_truncated: false,
+                },
+              },
+            },
+          },
+        }
+      }
+      const files = extractGroundedPaths(output, resultRoot)
       return {
         success: {
-          pattern: "",
-          path: cwd,
+          pattern,
+          path: requestedPath,
           output_mode: "files_with_matches",
           workspace_results: {
             [cwd]: {
               files: {
                 files,
                 total_files: files.length,
-                client_truncated: false,
+                client_truncated: parsedContent?.truncated ?? false,
               },
             },
           },

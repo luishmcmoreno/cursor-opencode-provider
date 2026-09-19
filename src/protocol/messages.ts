@@ -544,6 +544,8 @@ export function createMessageTypes(): protobuf.Root {
     { id: 1, name: "matches", type: "GrepFileMatch", repeated: true },
     { id: 2, name: "total_lines", type: "int32" },
     { id: 3, name: "total_matched_lines", type: "int32" },
+    { id: 4, name: "client_truncated", type: "bool" },
+    { id: 5, name: "ripgrep_truncated", type: "bool" },
   ])
   addType(
     root,
