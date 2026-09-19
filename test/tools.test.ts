@@ -2501,6 +2501,207 @@ describe("OpenCode 2 path and read edge cases", () => {
     )
   })
 
+  it("flattens grouped glob listings to files only", () => {
+    const output = [
+      "README.md",
+      "# src/",
+      "a.ts",
+      "## components/",
+      "button.tsx",
+      "# src/protocol/",
+      "tools.ts",
+      "# tests/",
+      "",
+      "Skipped missing paths: gone",
+    ].join("\n")
+    const found = buildTypedExecResult(
+      "pi_find_result",
+      output,
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { output: string } }
+    expect(found.success.output).toBe(
+      [
+        `${root}/README.md`,
+        `${root}/src/a.ts`,
+        `${root}/src/components/button.tsx`,
+        `${root}/src/protocol/tools.ts`,
+        "",
+        "Skipped missing paths: gone",
+      ].join("\n"),
+    )
+
+    const listed = buildTypedExecResult(
+      "grep_result",
+      output,
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { workspace_results: Record<string, { files: { files: string[] } }> } }
+    expect(listed.success.workspace_results[root]?.files.files).toEqual([
+      `${root}/README.md`,
+      `${root}/src/a.ts`,
+      `${root}/src/components/button.tsx`,
+      `${root}/src/protocol/tools.ts`,
+    ])
+
+    const flat = buildTypedExecResult(
+      "pi_find_result",
+      "src/\nsrc/a.ts",
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { output: string } }
+    expect(flat.success.output).toBe([`${root}/src/`, `${root}/src/a.ts`].join("\n"))
+  })
+
+  it("drops grouping headers that would list directories beside their files", () => {
+    const repro = [
+      "# /tmp/glob-repro/",
+      "afile.txt",
+      "## empty/",
+      "## onlydir/nested/",
+      "main.log",
+      "## dir-only-log/oh-my-pi/",
+      "main.log",
+    ].join("\n")
+    const found = buildTypedExecResult(
+      "pi_find_result",
+      repro,
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { output: string } }
+    expect(found.success.output).toBe(
+      [
+        "/tmp/glob-repro/afile.txt",
+        "/tmp/glob-repro/onlydir/nested/main.log",
+        "/tmp/glob-repro/dir-only-log/oh-my-pi/main.log",
+      ].join("\n"),
+    )
+
+    const onlydir = buildTypedExecResult(
+      "pi_find_result",
+      ["# /tmp/glob-repro/onlydir/nested/", "main.log"].join("\n"),
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { output: string } }
+    expect(onlydir.success.output).toBe("/tmp/glob-repro/onlydir/nested/main.log")
+
+    const logs = buildTypedExecResult(
+      "pi_find_result",
+      ["# /opt/local/var/macports/logs/", "## foo/", "main.log", "## bar/", "main.log"].join("\n"),
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { output: string } }
+    expect(logs.success.output).toBe(
+      ["/opt/local/var/macports/logs/foo/main.log", "/opt/local/var/macports/logs/bar/main.log"].join("\n"),
+    )
+
+    const listed = buildTypedExecResult(
+      "grep_result",
+      ["# /tmp/glob-repro/dir-only-log/", "main.log"].join("\n"),
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { workspace_results: Record<string, { files: { files: string[] } }> } }
+    expect(listed.success.workspace_results[root]?.files.files).toEqual([
+      "/tmp/glob-repro/dir-only-log/main.log",
+    ])
+
+    const emptiesOnly = buildTypedExecResult(
+      "pi_find_result",
+      ["# /tmp/glob-repro/", "## empty/", "## also/"].join("\n"),
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { output: string } }
+    expect(emptiesOnly.success.output).toBe("No files found")
+  })
+
+  it("does not turn a glob miss into a path back to the workspace", () => {
+    const miss = "No files found matching pattern"
+    const samples = [
+      miss,
+      ["# ../../../Users/mitra/Projects/macports-ports/", miss].join("\n"),
+      `../../../Users/mitra/Projects/macports-ports/${miss}`,
+      `# ../../../Users/mitra/Projects/macports-ports/${miss}`,
+    ]
+    for (const output of samples) {
+      const text = buildTypedExecResult(
+        "pi_find_result",
+        output,
+        undefined,
+        "glob",
+        undefined,
+        undefined,
+        root,
+      ) as { success: { output: string } }
+      expect(text.success.output).toBe(miss)
+
+      const mcp = buildTypedExecResult(
+        "mcp_result",
+        output,
+        undefined,
+        "glob",
+        undefined,
+        undefined,
+        root,
+      ) as { success: { content: Array<{ text: { text: string } }> } }
+      expect(mcp.success.content[0]?.text.text).toBe(miss)
+
+      const listed = buildTypedExecResult(
+        "grep_result",
+        output,
+        undefined,
+        "glob",
+        undefined,
+        undefined,
+        root,
+      ) as { success: { workspace_results: Record<string, { files: { files: string[] } }> } }
+      expect(listed.success.workspace_results[root]?.files.files).toEqual([])
+    }
+
+    const outside = [
+      "# /tmp/glob-repro/",
+      "## empty/",
+      "## full/",
+      "a.txt",
+      "## also/",
+    ].join("\n")
+    const dirs = buildTypedExecResult(
+      "pi_find_result",
+      outside,
+      undefined,
+      "glob",
+      undefined,
+      undefined,
+      root,
+    ) as { success: { output: string } }
+    expect(dirs.success.output).toBe(
+      ["/tmp/glob-repro/full/a.txt"].join("\n"),
+    )
+  })
+
   it("rewrites shell path tokens against the working directory and leaves prose", () => {
     const stdout = [
       "src/a.ts",
