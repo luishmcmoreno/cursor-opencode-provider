@@ -35,6 +35,10 @@ export type CursorCacheDiagnosticStats = {
   stepCompletes: number
   displayToolCalls: number
   execRequests: number
+  /** A CreatePlan interaction ran this Run (any outcome). Tags one-time upstream tools expansion. */
+  createPlanInTurn?: boolean
+  /** A SwitchMode interaction ran this Run (any outcome). */
+  switchModeInTurn?: boolean
 }
 
 /** Non-negative integer counter from a Cursor `turn_ended` field. */
@@ -191,6 +195,20 @@ export function formatCursorCacheDiagnostics(
     ? prior ? "warm" : "checkpoint-without-token-details"
     : "cold"
   const contextDelta = current && prior ? current.usedTokens - prior.usedTokens : undefined
+  const toolsDelta = categoryDelta.tools
+  // When our RequestContext tools overlay bytes are unchanged but Cursor's
+  // tools category still moves, the churn is upstream accounting (e.g. plan
+  // mode / CreatePlan internals), not a client prefix rebuild.
+  const toolsCategoryChurn =
+    stats.requestContextReused
+    && typeof toolsDelta === "number"
+    && toolsDelta !== 0
+      ? "upstream-stable-overlay"
+      : !stats.requestContextReused
+        && typeof toolsDelta === "number"
+        && toolsDelta !== 0
+        ? "client-overlay-changed"
+        : "none"
 
   return [
     "cache diagnosis:",
@@ -211,6 +229,7 @@ export function formatCursorCacheDiagnostics(
     `rawReadVsPriorContext=${prior ? usageRatio(rawRead, prior.usedTokens) : "n/a"}`,
     `sameSizedCategoryTokens=${categoriesComparable ? sameSizedCategoryTokens : "unavailable"}`,
     `categoryDelta=${categoriesComparable && Object.keys(categoryDelta).length > 0 ? JSON.stringify(categoryDelta) : "unavailable"}`,
+    `toolsCategoryChurn=${toolsCategoryChurn}`,
     `requestContext=${stats.requestContextReused ? "reused" : "built"}`,
     `requestContextHash=${stats.requestContextHash.slice(0, 16)}`,
     `systemPromptHash=${stats.systemPromptHash?.slice(0, 16) ?? "none"}`,
@@ -221,6 +240,8 @@ export function formatCursorCacheDiagnostics(
     `steps=${stats.stepStarts}/${stats.stepCompletes}`,
     `displayToolCalls=${stats.displayToolCalls}`,
     `execRequests=${stats.execRequests}`,
+    `createPlanInTurn=${stats.createPlanInTurn === true}`,
+    `switchModeInTurn=${stats.switchModeInTurn === true}`,
     "perModelCallCache=unavailable",
   ].join(" ")
 }

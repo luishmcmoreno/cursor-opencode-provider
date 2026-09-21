@@ -81,7 +81,7 @@ async function scanAgentRoot(
     let entries: Array<import("node:fs").Dirent>
     try {
       entries = await readdir(dir, { withFileTypes: true })
-      entries.sort((a, b) => a.name.localeCompare(b.name))
+      entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
     } catch {
       return
     }

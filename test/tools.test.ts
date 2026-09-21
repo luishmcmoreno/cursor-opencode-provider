@@ -203,8 +203,16 @@ describe("toolsToDescriptors", () => {
       { name: "custom_websearch", description: "Search" },
       { name: "custom_webfetch", description: "Fetch" },
     ])
-    expect(d.map((tool) => tool.name)).toEqual(["custom_webfetch", "custom_websearch"])
-    expect(d.map((tool) => tool.tool_name)).toEqual(["custom_webfetch", "custom_websearch"])
+    expect(d.map((tool) => tool.name)).toEqual(["custom_websearch", "custom_webfetch"])
+    expect(d.map((tool) => tool.tool_name)).toEqual(["custom_websearch", "custom_webfetch"])
+  })
+
+  it("emits descriptors in advertised order instead of sorting by name", () => {
+    const d = toolsToDescriptors([
+      { name: "read", description: "Read" },
+      { name: "bash", description: "Shell" },
+    ])
+    expect(d.map((tool) => tool.tool_name)).toEqual(["read", "bash"])
   })
 })
 
@@ -355,30 +363,33 @@ describe("toolsToMcpDescriptors", () => {
       { name: "brave_web_search", description: "Search" },
       { name: "bash", description: "Shell" },
     ], "opencode", ["github", "brave"])
-    expect(d.map((x) => x.server_identifier)).toEqual(["opencode", "brave", "github"])
+    expect(d.map((x) => x.server_identifier)).toEqual(["opencode", "github", "brave"])
     expect(d[0].server_name).toBe("opencode")
     expect((d[0].tools as Array<{ tool_name: string }>).map((t) => t.tool_name)).toEqual([
-      "bash",
       "read",
+      "bash",
     ])
     expect((d[1].tools as Array<{ tool_name: string }>).map((t) => t.tool_name)).toEqual([
-      "web_search",
-    ])
-    expect((d[2].tools as Array<{ tool_name: string }>).map((t) => t.tool_name)).toEqual([
       "create_pull_request",
       "get_me",
     ])
+    expect((d[2].tools as Array<{ tool_name: string }>).map((t) => t.tool_name)).toEqual([
+      "web_search",
+    ])
   })
 
-  it("is byte-stable when the host enumerates the same catalog in a different order", () => {
+  it("follows advertised order instead of sorting by name or server", () => {
     const tools = [
       { name: "read", description: "Read" },
       { name: "github_get_me", description: "Who am I" },
-      { name: "brave_web_search", description: "Search" },
       { name: "bash", description: "Shell" },
     ]
-    expect(toolsToMcpDescriptors(tools, "opencode", ["github", "brave"]))
-      .toEqual(toolsToMcpDescriptors([...tools].reverse(), "opencode", ["brave", "github"]))
+    const d = toolsToMcpDescriptors(tools, "opencode", ["github"])
+    expect(d.map((x) => x.server_identifier)).toEqual(["opencode", "github"])
+    expect((d[0].tools as Array<{ tool_name: string }>).map((t) => t.tool_name)).toEqual([
+      "read",
+      "bash",
+    ])
   })
 
   it("returns no descriptors for an empty tool list", () => {
@@ -645,6 +656,7 @@ describe("parseExecServerMessage", () => {
     expect(result!.toolName).toBe("write")
     expect(result!.args).toEqual({ filePath: "/out.txt", content: "hello" })
     expect(result!.resultField).toBe("write_result")
+    expect(result!.resultMetadata).toEqual({ path: "/out.txt" })
   })
 
   it("parses pi_write_args as OpenCode write + pi_write_result", () => {
@@ -655,6 +667,7 @@ describe("parseExecServerMessage", () => {
     expect(result!.toolName).toBe("write")
     expect(result!.args).toEqual({ filePath: "/out.txt", content: "hello pi" })
     expect(result!.resultField).toBe("pi_write_result")
+    expect(result!.resultMetadata).toEqual({ path: "/out.txt" })
   })
 
   it("decodes canonical field #28 and maps it to OpenCode task", () => {
@@ -1360,6 +1373,44 @@ describe("buildExecClientMessages", () => {
     expect(ec.id).toBe(2)
     expect(ec.read_result?.error?.error).toBe("File not found")
     expect(ec.read_result?.success).toBeUndefined()
+  })
+
+  it("echoes WriteArgs.path on WriteSuccess when host output has no path tag", () => {
+    const parsed = parseExecServerMessage({
+      id: 3,
+      write_args: { path: "/tmp/agent-tools/spill.txt", file_text: "{}" },
+    })!
+    const frames = buildExecClientMessages({
+      execId: parsed.id,
+      resultField: parsed.resultField,
+      output: "Successfully wrote 64891 bytes to /tmp/agent-tools/spill.txt",
+      resultMetadata: parsed.resultMetadata,
+    })
+    const success = decodeMessage<any>("AgentClientMessage", frames[0])
+      .exec_client_message.write_result.success
+    expect(success.path).toBe("/tmp/agent-tools/spill.txt")
+  })
+
+  it("does not invent a WriteSuccess.path from tag-free host write prose", () => {
+    const frames = buildExecClientMessages({
+      execId: 3,
+      resultField: "write_result",
+      output: "Successfully wrote 64891 bytes to /tmp/agent-tools/spill.txt",
+    })
+    const success = decodeMessage<any>("AgentClientMessage", frames[0])
+      .exec_client_message.write_result.success
+    expect(success.path).toBe("")
+  })
+
+  it("falls back to a <path> tag when write result metadata has no path", () => {
+    const frames = buildExecClientMessages({
+      execId: 3,
+      resultField: "write_result",
+      output: "Wrote\n<path>/tagged.txt</path>",
+    })
+    const success = decodeMessage<any>("AgentClientMessage", frames[0])
+      .exec_client_message.write_result.success
+    expect(success.path).toBe("/tagged.txt")
   })
 
   it("encodes pi_write_result success as { output }", () => {
@@ -2569,7 +2620,7 @@ describe("OpenCode 2 path and read edge cases", () => {
       "## empty/",
       "## onlydir/nested/",
       "main.log",
-      "## dir-only-log/oh-my-pi/",
+      "## dir-only-log/vendor-cli/",
       "main.log",
     ].join("\n")
     const found = buildTypedExecResult(
@@ -2585,7 +2636,7 @@ describe("OpenCode 2 path and read edge cases", () => {
       [
         "/tmp/glob-repro/afile.txt",
         "/tmp/glob-repro/onlydir/nested/main.log",
-        "/tmp/glob-repro/dir-only-log/oh-my-pi/main.log",
+        "/tmp/glob-repro/dir-only-log/vendor-cli/main.log",
       ].join("\n"),
     )
 
@@ -2642,9 +2693,9 @@ describe("OpenCode 2 path and read edge cases", () => {
     const miss = "No files found matching pattern"
     const samples = [
       miss,
-      ["# ../../../Users/mitra/Projects/macports-ports/", miss].join("\n"),
-      `../../../Users/mitra/Projects/macports-ports/${miss}`,
-      `# ../../../Users/mitra/Projects/macports-ports/${miss}`,
+      ["# ../../../workspace/example-project/", miss].join("\n"),
+      `../../../workspace/example-project/${miss}`,
+      `# ../../../workspace/example-project/${miss}`,
     ]
     for (const output of samples) {
       const text = buildTypedExecResult(

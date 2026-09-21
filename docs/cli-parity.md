@@ -71,7 +71,7 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 
 | Feature | Cursor CLI | This provider | Match |
 |---|---|---|---|
-| Checkpoint handling | Full read/write (agent-kv) | Decode + reachable-blob export graph; rebase on >100 MiB budget | ✅ |
+| Checkpoint handling | Full read/write (agent-kv); soft-reuse incomplete/large | Decode + reachable-blob export graph; warn on >100 MiB / incomplete, never remint | ✅ |
 | KV blobs | sqlite blob store + AES-GCM encryption + merkle tree | Blob store + reachability; writes serialized w/ backpressure | ✅ |
 | Conversation restart/resume | store.db, resume.tsx, fork-chat-session, export | `conversation-persistence.ts` (atomic pb.gz snapshot, 24h expiry, compaction rotation) | 🔶 |
 | Token details (used/max/category breakdown) | `ConversationStateStructure.tokenDetails` → UI tray | `token-details.ts` → `providerMetadata.cursor.context`; AI SDK usage = authoritative total | ✅ |

@@ -16,6 +16,24 @@ export {
   transferFrozenRequestContext,
 } from "./frozen.js"
 export {
+  MAX_OVERLAY_HOLDS,
+  holdCapabilityOverlay,
+  resetOverlayHoldsForTests,
+} from "./overlay.js"
+export {
+  admitContextEpoch,
+  appendMidConversationMessage,
+  clearContextEpoch,
+  endContextEpoch,
+  getContextEpoch,
+  MAX_CONTEXT_EPOCHS,
+  resetContextEpochsForTests,
+  type AdmitContextEpochInput,
+  type AdmitContextEpochResult,
+  type ContextEpoch,
+  type ContextSourceSnapshot,
+} from "./epoch.js"
+export {
   HOST_PATH_BRIDGE,
   getHostCacheDirOverride,
   opencodeGlobalCacheDir,

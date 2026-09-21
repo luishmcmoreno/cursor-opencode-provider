@@ -61,6 +61,7 @@ import {
   listProtobufFieldNumbers,
   parseDisplayToolCall,
   resolveBridgedOpenCodeToolCall,
+  isNativeDisplayToolCall,
   snapshotMirroredTodos,
   snapshotMirroredTodosFromReadOutput,
 } from "./protocol/tool-call-bridge.js"
@@ -116,7 +117,7 @@ import {
 } from "./protocol/generate-image.js"
 import { stageCursorImage } from "./image-staging.js"
 import { IMAGE_PERMISSION_DENIED_PREFIX } from "./image-save.js"
-import { clearCheckpoint, getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
+import { getCheckpoint, setCheckpoint } from "./protocol/checkpoint.js"
 import {
   cursorContextUsageMetadata,
   decodeConversationTokenDetails,
@@ -124,14 +125,12 @@ import {
   type CursorConversationTokenDetails,
 } from "./protocol/token-details.js"
 import {
-  clearConversationBlobs,
   conversationBlobCount,
   inspectConversationBlobGraph,
   type ConversationBlobGraphStats,
 } from "./protocol/blob-store.js"
 import {
   bindConversationId,
-  isActiveConversationBinding,
   resolveConversationGroupId,
 } from "./protocol/conversation-bind.js"
 import {
@@ -161,6 +160,11 @@ import {
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getOrBuildRequestContext } from "./context/frozen.js"
+import {
+  admitContextEpoch,
+  appendMidConversationMessage,
+  resetContextEpochsForTests,
+} from "./context/epoch.js"
 import { workspaceRootFromRequestContext } from "./context/env.js"
 import {
   ensureOpencodeProjectDir,
@@ -225,14 +229,29 @@ const MAX_RETRY_DELAY_MS = 30_000
 const RUN_REQUEST_DECODE_FAILED = "CURSOR_RUN_REQUEST_DECODE_FAILED"
 const RUN_REQUEST_UNSUPPORTED = "CURSOR_RUN_REQUEST_UNSUPPORTED"
 const RUN_REPLY_FAILED = "CURSOR_RUN_REPLY_FAILED"
-/** Cursor's own conversation export path treats state above 100 MiB as large. */
+/**
+ * Cursor CLI's conversation **export / transfer-to-cloud** path treats state
+ * above 100 MiB as large (`conversation-export.ts` default `104857600`). That
+ * budget must not remint a sticky conversation on resume — CLI soft-reuses.
+ */
 export const MAX_CHECKPOINT_BLOB_GRAPH_BYTES = 100 * 1024 * 1024
 
+/** @deprecated Never remints; kept for call-site/tests. Always false. */
 export function checkpointBlobGraphRequiresRebase(
+  _stats: ConversationBlobGraphStats,
+  _maxBytes = MAX_CHECKPOINT_BLOB_GRAPH_BYTES,
+): boolean {
+  return false
+}
+
+/** Warn-only concern for incomplete / oversized checkpoint graphs (no remint). */
+export function checkpointBlobGraphConcern(
   stats: ConversationBlobGraphStats,
   maxBytes = MAX_CHECKPOINT_BLOB_GRAPH_BYTES,
-): boolean {
-  return !stats.complete || stats.bytes > maxBytes
+): "incomplete-checkpoint-graph" | "oversized-checkpoint-graph" | undefined {
+  if (!stats.complete) return "incomplete-checkpoint-graph"
+  if (stats.bytes > maxBytes) return "oversized-checkpoint-graph"
+  return undefined
 }
 
 type ResponseRequiredChannel = "exec" | "kv" | "interaction" | "multiple"
@@ -592,17 +611,16 @@ function rememberPromptIdentity(sessionKey: string, value: PromptIdentity): void
   }
 }
 
-function promptIdentityChanged(previous: PromptIdentity, current: PromptIdentity): boolean {
-  // Compare only facts the current host supplied. This keeps standalone calls
-  // and older compatibility surfaces from invalidating a valid checkpoint just
-  // because they cannot expose an agent id.
-  return (
-    (current.hostAgent !== undefined && previous.hostAgent !== current.hostAgent)
-    || (
-      current.systemPromptHash !== undefined
-      && previous.systemPromptHash !== current.systemPromptHash
-    )
-  )
+/**
+ * Prompt identity is diagnostics / persistence only and never drives remint.
+ * Kept as a named helper so call sites / tests that still mention identity
+ * churn have a single no-op definition.
+ */
+export function promptIdentityWouldRemint(
+  _previous: PromptIdentity,
+  _current: PromptIdentity,
+): boolean {
+  return false
 }
 
 function sentHistoryImageHashes(sessionKey: string | undefined): ReadonlySet<string> | undefined {
@@ -730,6 +748,19 @@ async function doStreamImpl(
       const historical = extractToolResults(prompt).length
       if (historical > 0) {
         trace(`fresh turn: ignoring ${historical} historical tool result(s) (not trailing)`)
+      }
+      // Host may start a new user turn while the prior Run still has pending
+      // tools. Finish that Run on the same conversation (cancel stranded execs,
+      // drain turn_ended) before opening the new Run so the checkpoint prefix
+      // is preserved. registerSession will not close a prior Run that still
+      // has real pending execs; a failed prepare leaves that Run held.
+      try {
+        await preparePriorSessionForFreshTurn(opencodeSessionKey(callOptions))
+      } catch (error) {
+        trace(
+          `fresh turn: prepare-prior failed — opening the new Run and leaving ` +
+            `any still-pending prior held — ${(error as Error).message}`,
+        )
       }
       session = await openSession()
     }
@@ -1024,16 +1055,12 @@ async function startSession(
   )
   const baseSystemPrompt = extractSystemPrompt(prompt)
   const interactionGuidance = buildOpenCodeInteractionGuidance(cursorTools, isCompaction, workspaceRoot)
-  const stableSystemPrompt = [baseSystemPrompt, interactionGuidance].filter(Boolean).join("\n\n")
-  const stableSystemPromptHash = stableSystemPrompt
-    ? createHash("sha256").update(stableSystemPrompt).digest("hex")
-    : undefined
+  // Prompt-identity diagnostics are filled after Context Epoch admission below
+  // (baseline hash is the epoch baseline, not a per-turn host hash).
+  let frozenSystemPromptHash: string | undefined
   const resetState = resolveTurnConversationReset({
     sessionKey,
     isCompaction,
-    ...(lifecycle
-      ? {}
-      : { promptIdentity: { hostAgent, systemPromptHash: stableSystemPromptHash } }),
   })
   // Compaction must not reuse the prior conversation; its first normal turn
   // must also rebase so the summary-agent checkpoint cannot replace the normal
@@ -1052,31 +1079,20 @@ async function startSession(
   let checkpointGraph: ConversationBlobGraphStats = conversationState
     ? inspectConversationBlobGraph(bound.conversationId, conversationState)
     : { count: 0, bytes: 0, complete: true }
-  let forcedResetReason: string | undefined
-  if (conversationState && checkpointBlobGraphRequiresRebase(checkpointGraph)) {
-    const previousConversationId = bound.conversationId
-    forcedResetReason = checkpointGraph.complete
-      ? "oversized-checkpoint-graph"
-      : "incomplete-checkpoint-graph"
-    trace(
-      `checkpoint state rejected: reason=${forcedResetReason} ` +
-        `conversationId=${previousConversationId} checkpointBytes=${conversationState.length} ` +
-        `blobCount=${checkpointGraph.count} blobBytes=${checkpointGraph.bytes} ` +
-        `limitBytes=${MAX_CHECKPOINT_BLOB_GRAPH_BYTES} ` +
-        `detail=${checkpointGraph.fallbackReason ?? "-"} action=rebase`,
-    )
-    // A recovery resume must become a history rebase so the interrupted user
-    // request remains in the seed. An ordinary turn keeps its normal user text.
-    if (recovery?.kind === "resume") recovery = { kind: "rebase" }
-    resumeRecovery = undefined
-    resuming = false
-    if (!sessionKey) {
-      clearCheckpoint(previousConversationId)
-      clearConversationBlobs(previousConversationId)
+  const forcedResetReason: string | undefined = undefined
+  // CLI soft-reuses incomplete / oversized graphs (100 MiB is export-only).
+  // Never remint — warn and keep the sticky conversation + checkpoint.
+  if (conversationState) {
+    const concern = checkpointBlobGraphConcern(checkpointGraph)
+    if (concern) {
+      trace(
+        `checkpoint state warning: reason=${concern} ` +
+          `conversationId=${bound.conversationId} checkpointBytes=${conversationState.length} ` +
+          `blobCount=${checkpointGraph.count} blobBytes=${checkpointGraph.bytes} ` +
+          `limitBytes=${MAX_CHECKPOINT_BLOB_GRAPH_BYTES} ` +
+          `detail=${checkpointGraph.fallbackReason ?? "-"} action=warm-reuse`,
+      )
     }
-    bound = bindConversationId(sessionKey, { reset: true })
-    conversationState = undefined
-    checkpointGraph = { count: 0, bytes: 0, complete: true }
   }
   const conversationId = bound.conversationId
   const conversationGroupId = resolveConversationGroupId(sessionKey, conversationId)
@@ -1106,22 +1122,53 @@ async function startSession(
   const activeMode = getActiveCursorMode(sessionKey)
   const nativePlanPromptOwnsMode = hostAgent === "plan"
     && (activeMode === "plan" || activeMode === "spec")
-  const modeReminder = isCompaction || startedWithCheckpoint || lifecycle || nativePlanPromptOwnsMode
+  // Mode/kickoff are chronological Mid-Conversation updates (V2), including on
+  // checkpoint Turns — never folded into the frozen system baseline.
+  const modeReminder = isCompaction || lifecycle || nativePlanPromptOwnsMode
     ? undefined
     : takeActiveCursorModeReminder(sessionKey, {
         advertisedTools: cursorTools.map((tool) => tool.name),
       })
-  const kickoffWarning = isCompaction || startedWithCheckpoint || lifecycle
+  const kickoffWarning = isCompaction || lifecycle
     ? undefined
     : takePlanExecutionKickoffWarning(sessionKey)
-  const systemPrompt = [
-    baseSystemPrompt,
-    interactionGuidance,
+  const oneShotReminders = [
     modeReminder,
     kickoffWarning ? `<system_reminder>${kickoffWarning}</system_reminder>` : undefined,
-  ]
-    .filter(Boolean)
-    .join("\n\n")
+  ].filter((part): part is string => !!part)
+
+  let systemPrompt: string | undefined
+  if (isCompaction || lifecycle) {
+    // Ephemeral summary/title Runs — do not initialize a sticky Context Epoch.
+    systemPrompt = startedWithCheckpoint
+      ? undefined
+      : [baseSystemPrompt, interactionGuidance, ...oneShotReminders].filter(Boolean).join("\n\n")
+    if (startedWithCheckpoint && oneShotReminders.length) {
+      userText = appendMidConversationMessage(userText, oneShotReminders.join("\n\n"))
+    }
+  } else {
+    const admitted = admitContextEpoch({
+      conversationId,
+      hasCheckpoint: startedWithCheckpoint,
+      hostSystem: baseSystemPrompt,
+      guidance: interactionGuidance,
+      hostAgent,
+      workspaceRoot,
+      oneShotReminders,
+    })
+    systemPrompt = startedWithCheckpoint ? undefined : admitted.seedSystemPrompt
+    userText = appendMidConversationMessage(userText, admitted.midConversationMessage)
+    // A recovered epoch has no baseline bytes. Keep the hash restored from
+    // the checkpoint snapshot so this turn's TurnEnded save does not drop it.
+    const previousIdentity = sessionKey ? promptIdentityBySession.get(sessionKey) : undefined
+    frozenSystemPromptHash = admitted.epoch.baselineHash.trim() || previousIdentity?.systemPromptHash
+    if (sessionKey) {
+      rememberPromptIdentity(sessionKey, {
+        hostAgent: hostAgent || previousIdentity?.hostAgent,
+        systemPromptHash: frozenSystemPromptHash,
+      })
+    }
+  }
   const history = extractPromptHistory(prompt, {
     preserveTrailingUser: recovery?.kind === "rebase",
     toolResults: isCompaction ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
@@ -1349,10 +1396,12 @@ async function startSession(
       stepCompletes: 0,
       displayToolCalls: 0,
       execRequests: 0,
+      createPlanInTurn: false,
+      switchModeInTurn: false,
     },
     openCodeSessionId: lifecycle ? undefined : sessionKey,
     hostAgent,
-    stableSystemPromptHash,
+    stableSystemPromptHash: frozenSystemPromptHash,
     postCompactionRebase: isCompaction,
     toolCatalog: snapshotToolCatalog(sessionKey),
     stream,
@@ -1372,6 +1421,9 @@ async function startSession(
     subagentCatalog,
     requestContext,
     allowTools,
+    permittedToolNames: new Set(
+      allowTools ? incomingTools.map((tool) => tool.name).filter((name): name is string => !!name) : [],
+    ),
     usageEstimate,
     pumpActive: false,
     pumpOwner: null,
@@ -1463,6 +1515,342 @@ export function findContinuationSession(
     if (s) return s
   }
   return undefined
+}
+
+/** How long a fresh-turn drain may wait for Cursor `turn_ended` after bridged settle. */
+export const FRESH_TURN_DRAIN_TIMEOUT_MS = 8_000
+
+/**
+ * Error text written onto Cursor execs that the host abandoned by starting a
+ * new user turn before returning the tool result. Completing the held Run with
+ * this cancel (then draining to `turn_ended`) keeps the same conversation
+ * prefix instead of `superseded-by-new-run` mid-exec.
+ */
+export const FRESH_TURN_PENDING_CANCEL_REASON =
+  "Host started a new user turn before this tool result was delivered"
+
+/**
+ * Before opening a new user-turn Run, finish the prior held-open Run cleanly:
+ * settle display-only bridged pendings, cancel any real execs still waiting on
+ * the host, then drain for `turn_ended`. That preserves the same
+ * conversation_id / checkpoint prefix instead of aborting mid-tool.
+ */
+export async function preparePriorSessionForFreshTurn(
+  openCodeSessionId: string | undefined,
+  opts?: { timeoutMs?: number },
+): Promise<"drained" | "settled-only" | "busy" | "none"> {
+  const prior = sessionManager.findOpenByOpenCodeSessionId(openCodeSessionId)
+  if (!prior) return "none"
+
+  const settledBridged = sessionManager.settleBridgedPending(prior)
+  if (settledBridged > 0) {
+    trace(
+      `fresh turn: settled ${settledBridged} bridged pending on prior session ${prior.sessionId} ` +
+        `remainingPending=${prior.pending.size}`,
+    )
+  }
+
+  if (sessionManager.isActivelyPumping(prior)) {
+    // A live pull owns the stream; do not race cancel writes against it.
+    // Wait briefly for the pump to finish, then cancel + drain.
+    const waited = await waitUntilNotPumping(prior, {
+      timeoutMs: opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS,
+    })
+    if (!waited) {
+      trace(
+        `fresh turn: prior session ${prior.sessionId} is still pumping after wait — ` +
+          `leaving that Run held; registerSession will not close it`,
+      )
+      return "busy"
+    }
+  }
+
+  if (prior.closed) return "none"
+
+  const cancelled = cancelPendingExecsForFreshTurn(prior)
+  if (cancelled > 0) {
+    trace(
+      `fresh turn: cancelled ${cancelled} pending exec(s) on prior session ${prior.sessionId} ` +
+        `remainingPending=${prior.pending.size}`,
+    )
+  }
+
+  if (prior.closed) {
+    // Cancel path closed the session (encode/write failure). Caller opens a
+    // fresh Run on the same conversation_id — better than mid-exec supersede
+    // with stranded pending, but turn_ended may be missing.
+    return cancelled > 0 || settledBridged > 0 ? "settled-only" : "none"
+  }
+
+  if (prior.pending.size > 0) {
+    trace(
+      `fresh turn: prior session ${prior.sessionId} still has ${prior.pending.size} ` +
+        `pending after cancel — leaving that Run held; registerSession will not close it`,
+    )
+    return "busy"
+  }
+
+  const outcome = await drainSessionUntilTurnEnded(prior, {
+    timeoutMs: opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS,
+  })
+  trace(`fresh turn: prior session ${prior.sessionId} drain outcome=${outcome}`)
+  if (outcome === "turn-ended") return "drained"
+  if (cancelled > 0 || settledBridged > 0) return "settled-only"
+  return outcome === "timeout" || outcome === "interrupted" ? "settled-only" : "busy"
+}
+
+/**
+ * Write error/reject results for every still-open non-bridged pending on the
+ * held Run so Cursor can finish the agent turn instead of being superseded.
+ *
+ * @returns number of pendings successfully cancelled
+ */
+export function cancelPendingExecsForFreshTurn(session: CursorSession): number {
+  if (session.closed || session.pending.size === 0) return 0
+  const synthetic: ExtractedToolResult[] = []
+  for (const [execId, pending] of session.pending.entries()) {
+    if (pending.bridged) continue
+    if (pending.state !== "pending") continue
+    synthetic.push({
+      toolCallId: `cursor_${session.sessionId}_${execId}`,
+      sessionId: session.sessionId,
+      execId,
+      toolName: pending.toolName ?? "unknown",
+      output: FRESH_TURN_PENDING_CANCEL_REASON,
+      error: FRESH_TURN_PENDING_CANCEL_REASON,
+    })
+  }
+  if (synthetic.length === 0) return 0
+  const before = session.pending.size
+  const delivered = deliverContinuationResults(session, synthetic)
+  if (!delivered || delivered.closed) {
+    // deliverContinuationResults closes on encode/write failure after some
+    // claims may already have succeeded.
+    return Math.max(0, before - session.pending.size)
+  }
+  return Math.max(0, before - session.pending.size)
+}
+
+async function waitUntilNotPumping(
+  session: CursorSession,
+  opts: { timeoutMs: number },
+): Promise<boolean> {
+  if (!sessionManager.isActivelyPumping(session)) return true
+  const deadlineAt = Date.now() + Math.max(1, opts.timeoutMs)
+  while (Date.now() < deadlineAt) {
+    if (session.closed) return false
+    if (!sessionManager.isActivelyPumping(session)) return true
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 25)
+      timer.unref?.()
+    })
+  }
+  return !sessionManager.isActivelyPumping(session)
+}
+
+function nextFrameWithTimeout(
+  frames: AsyncIterator<Frame>,
+  timeoutMs: number,
+): Promise<IteratorResult<Frame> | { done: true; timedOut: true }> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (
+      value?: IteratorResult<Frame> | { done: true; timedOut: true },
+      error?: unknown,
+    ) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (error !== undefined) reject(error)
+      else resolve(value!)
+    }
+    const timer = setTimeout(() => finish({ done: true, timedOut: true }), timeoutMs)
+    timer.unref?.()
+    void frames.next().then(
+      value => finish(value),
+      error => finish(undefined, error),
+    )
+  })
+}
+
+/**
+ * Read remaining frames on an idle held-open Run until `turn_ended`, a
+ * response-requiring request we cannot answer without the host, or timeout.
+ * Used only on the fresh-turn settle path — not a general pump substitute.
+ */
+export async function drainSessionUntilTurnEnded(
+  session: CursorSession,
+  opts?: { timeoutMs?: number },
+): Promise<"turn-ended" | "busy" | "timeout" | "interrupted" | "skipped"> {
+  if (session.closed) return "skipped"
+  if (session.pending.size > 0 || sessionManager.isActivelyPumping(session)) return "busy"
+
+  const timeoutMs = Math.max(1, opts?.timeoutMs ?? FRESH_TURN_DRAIN_TIMEOUT_MS)
+  const owner = Symbol(`fresh-turn-drain:${session.sessionId}`)
+  sessionManager.beginPump(session, owner)
+  const deadlineAt = Date.now() + timeoutMs
+  let outcome: "turn-ended" | "busy" | "timeout" | "interrupted" = "timeout"
+
+  try {
+    while (Date.now() < deadlineAt) {
+      if (session.closed) {
+        outcome = "interrupted"
+        break
+      }
+      const remainingMs = Math.max(1, deadlineAt - Date.now())
+      let next: IteratorResult<Frame> | { done: true; timedOut: true }
+      try {
+        next = await nextFrameWithTimeout(session.frames, remainingMs)
+      } catch (error) {
+        trace(
+          `fresh turn drain: frame wait failed sessionId=${session.sessionId} ` +
+            `err=${(error as Error).message}`,
+        )
+        outcome = "interrupted"
+        break
+      }
+      if ("timedOut" in next && next.timedOut) {
+        outcome = "timeout"
+        break
+      }
+      if (next.done) {
+        outcome = "interrupted"
+        break
+      }
+
+      const frame = next.value as Frame
+      if (frame.flags & 0x02) {
+        outcome = "interrupted"
+        break
+      }
+
+      let payload: Uint8Array
+      try {
+        payload = decodeFramePayload(frame)
+      } catch {
+        continue
+      }
+      let asm: Record<string, unknown>
+      try {
+        asm = decodeMessage<Record<string, unknown>>("AgentServerMessage", payload)
+      } catch {
+        continue
+      }
+
+      const iu = asm.interaction_update as Record<string, unknown> | undefined
+      const kv = asm.kv_server_message as Record<string, unknown> | undefined
+      const esm = asm.exec_server_message as Record<string, unknown> | undefined
+      const interactionQuery = asm.interaction_query as Record<string, unknown> | undefined
+      const checkpointRaw = asm.conversation_checkpoint_update
+      const requiredChannel = responseRequiredChannel(payload)
+
+      if (checkpointRaw != null) {
+        const bytes = normalizeCheckpointBytes(checkpointRaw)
+        if (bytes && bytes.length > 0) {
+          if (session.cacheDiagnostics) session.cacheDiagnostics.checkpointUpdates++
+          setCheckpoint(session.conversationId, bytes)
+          session.resumeCheckpoint = Uint8Array.from(bytes)
+          const tokenDetails = decodeConversationTokenDetails(bytes)
+          if (tokenDetails) {
+            if (session.cacheDiagnostics) session.cacheDiagnostics.tokenDetailUpdates++
+            session.tokenDetails = tokenDetails
+            session.tokenDetailsFresh = true
+          }
+        }
+      }
+
+      if (iu?.turn_ended) {
+        trace(`fresh turn drain: turn_ended raw wire fields: ${debugWalkTurnEnded(payload)}`)
+        if (session.openCodeSessionId) {
+          await persistConversationState(
+            session.cacheDir ?? opencodeGlobalCacheDir(),
+            {
+              sessionKey: session.openCodeSessionId,
+              conversationId: session.conversationId,
+              requestContext: session.requestContext,
+              toolCatalog: session.toolCatalog ?? [],
+              postCompactionRebase: session.postCompactionRebase,
+              hostAgent: session.hostAgent,
+              systemPromptHash: session.stableSystemPromptHash,
+            },
+          ).catch((error) => {
+            trace(
+              `fresh turn drain: TurnEnded save failed ` +
+                `sessionKey=${session.openCodeSessionId}: ${String(error)}`,
+            )
+          })
+        }
+        // Record TurnEnded cache counters on diagnostics for the abandoned Run
+        // even though no OpenCode stream consumer will see this finish.
+        const turnEnded = iu.turn_ended as Record<string, unknown>
+        const counters = cursorUsageCountersFromTurnEnded(turnEnded)
+        if (session.cacheDiagnostics) {
+          trace(formatCursorCacheDiagnostics(
+            counters,
+            session.tokenDetails,
+            session.cacheDiagnostics.priorTokenDetails,
+            {
+              ...session.cacheDiagnostics,
+              conversationGroupId: session.cacheDiagnostics.conversationGroupId
+                ?? resolveConversationGroupId(session.openCodeSessionId, session.conversationId),
+              modelId: session.cacheDiagnostics.modelId,
+            },
+          ))
+        } else {
+          trace(
+            `fresh turn drain: turn_ended input=${counters.inputTokens} ` +
+              `cacheRead=${counters.cacheRead} output=${counters.outputTokens}`,
+          )
+        }
+        sessionManager.close(session, "turn-ended")
+        outcome = "turn-ended"
+        break
+      }
+
+      if (kv) {
+        const handled = handleKvServerMessage(kv, session)
+        if (!handled) {
+          outcome = "busy"
+          break
+        }
+        try {
+          await writeWithBackpressure(
+            session.stream,
+            handled.reply,
+            `fresh-turn-drain KV ${handled.kind}_blob reply id=${handled.id}`,
+          )
+        } catch (error) {
+          trace(
+            `fresh turn drain: KV reply failed sessionId=${session.sessionId} ` +
+              `err=${(error as Error).message}`,
+          )
+          outcome = "interrupted"
+          break
+        }
+        sessionManager.recordSemanticProgress(session)
+        continue
+      }
+
+      // Text/thinking/heartbeat/partial display updates can be ignored while draining.
+      if (iu?.text_delta || iu?.thinking_delta || iu?.heartbeat || iu?.partial_tool_call || iu?.step_started || iu?.step_completed) {
+        sessionManager.recordSemanticProgress(session)
+        continue
+      }
+      if (iu?.tool_call_started || iu?.tool_call_completed) {
+        // A new display tool needs host mediation — stop draining.
+        outcome = "busy"
+        break
+      }
+
+      if (esm || interactionQuery || requiredChannel === "exec" || requiredChannel === "interaction") {
+        outcome = "busy"
+        break
+      }
+    }
+  } finally {
+    sessionManager.endPump(session, owner)
+  }
+  return outcome
 }
 
 /**
@@ -2025,6 +2413,8 @@ export async function pump(
     stepCompletes: 0,
     displayToolCalls: 0,
     execRequests: 0,
+    createPlanInTurn: false,
+    switchModeInTurn: false,
   }
   cacheDiagnostics.pumpPasses++
   const { textId, reasoningId } = ids
@@ -2374,15 +2764,34 @@ export async function pump(
     const occupancySource = occupancyDetails
       ? `occupancy-${contextSource ?? "unavailable"}`
       : "intermediate-zero"
+    // Occupancy finishes never see Cursor TurnEnded cache_read. usageEstimate.cacheRead
+    // stays 0 for the whole Run, so logging it as rawCacheRead falsely reports 0% on
+    // every tool-call step. Prefer the V3 occupancy partition (prior prefix → cacheRead)
+    // and label the estimate separately from billed TurnEnded counters.
+    const occupancyPrefixCache = occupancyDetails
+      ? (session.cacheDiagnostics?.priorTokenDetails?.usedTokens ?? 0)
+      : undefined
+    const rawIn = te
+      ? turnEndedCounter(te, "input_tokens")
+      : occupancyDetails
+        ? occupancyDetails.usedTokens
+        : est.inputTokens
+    const rawOut = te
+      ? turnEndedCounter(te, "output_tokens")
+      : occupancyDetails
+        ? 1
+        : est.outputTokens
+    const rawCacheRead = te
+      ? turnEndedCounter(te, "cache_read")
+      : occupancyPrefixCache ?? est.cacheRead
+    const rawCacheWrite = te ? turnEndedCounter(te, "cache_write") : est.cacheWrite
     trace(
       `finish: reason=${reasonLabel} ` +
         `v3In=${inTotal} v3Out=${outTotal} ` +
         `v3CacheRead=${usage.inputTokens?.cacheRead ?? 0} v3CacheWrite=${usage.inputTokens?.cacheWrite ?? 0} ` +
         `v3Reasoning=${usage.outputTokens?.reasoning ?? 0} ` +
-        `rawIn=${te ? turnEndedCounter(te, "input_tokens") : est.inputTokens} ` +
-        `rawOut=${te ? turnEndedCounter(te, "output_tokens") : est.outputTokens} ` +
-        `rawCacheRead=${te ? turnEndedCounter(te, "cache_read") : est.cacheRead} ` +
-        `rawCacheWrite=${te ? turnEndedCounter(te, "cache_write") : est.cacheWrite} ` +
+        `rawIn=${rawIn} rawOut=${rawOut} rawCacheRead=${rawCacheRead} rawCacheWrite=${rawCacheWrite} ` +
+        `${occupancyPrefixCache !== undefined ? `occupancyPrefixCache=${occupancyPrefixCache} ` : ""}` +
         `source=${te
           ? settledSource ?? (contextSource ?? "unavailable")
           : occupancySource}`,
@@ -2690,11 +3099,20 @@ export async function pump(
                 `keys=[${Object.keys(toolCall).join(",")}]${wire}`,
             )
           } else if (!bridged) {
-            trace(
-              `display tool_call_completed: no advertised OpenCode tool ` +
-                `callId=${callId} variant=${display.variant} preferred=${display.preferredToolName} ` +
-                `advertised=[${advertised.join(",")}]`,
-            )
+            // GetMcpTools / GetDynamicTools is executed by Cursor after mcp_state;
+            // large catalogs then spill through write_args. Not a missing host tool.
+            if (isNativeDisplayToolCall(display.variant)) {
+              trace(
+                `display tool_call_completed: native ${display.preferredToolName} callId=${callId} ` +
+                  `(server-side catalog; spill uses write_args)`,
+              )
+            } else {
+              trace(
+                `display tool_call_completed: no advertised OpenCode tool ` +
+                  `callId=${callId} variant=${display.variant} preferred=${display.preferredToolName} ` +
+                  `advertised=[${advertised.join(",")}]`,
+              )
+            }
           } else {
             // Snapshot only Cursor todo writes (not create_plan's synthetic
             // "plan" prepend) so later merge patches apply onto a real list.
@@ -2994,6 +3412,26 @@ export async function pump(
             if (!await rejectExec(parsed, reason, "unavailable tool")) return
             continue
           }
+          // Epoch advertisement may keep tools the host filtered this turn
+          // (plan denies edit). Refuse those here — do not emit to OpenCode.
+          const permittedToolNames = session.permittedToolNames
+          if (
+            permittedToolNames
+            && permittedToolNames.size > 0
+            && !permittedToolNames.has(parsed.toolName)
+          ) {
+            const permitted = [...permittedToolNames].sort().join(", ")
+            const reason =
+              `OpenCode tool '${parsed.toolName}' is not permitted for the current agent this turn. ` +
+              `Permitted tools: ${permitted || "none"}. Continue using only permitted tools; do not retry ` +
+              `'${parsed.toolName}'.`
+            trace(
+              `exec: not permitted this turn toolName=${parsed.toolName} ` +
+                `permitted=[${[...permittedToolNames].sort().join(",")}]`,
+            )
+            if (!await rejectExec(parsed, reason, "not permitted this turn")) return
+            continue
+          }
           if (recoverCorrelatedEditRead(parsed, displayCallId)) continue
           if (rejectMissingReadTarget(parsed)) {
             if (displayCallId) session.displayToolCalls.delete(displayCallId)
@@ -3133,6 +3571,15 @@ export async function pump(
             `field=${handled.variantField} outcome=${handled.outcome}` +
             (handled.reply ? "" : " (deferred to host tool result)"),
         )
+        // Tag the Run for cache diagnosis: a first CreatePlan/SwitchMode can
+        // coincide with a one-time upstream tools-category expansion. Set on
+        // any outcome (acknowledged/approved/bridged) via presence, not kind.
+        if (handled.createPlan && session.cacheDiagnostics) {
+          session.cacheDiagnostics.createPlanInTurn = true
+        }
+        if (handled.switchMode && session.cacheDiagnostics) {
+          session.cacheDiagnostics.switchModeInTurn = true
+        }
         if (handled.generateImage) {
           trace(
             `interaction_query: approved generate_image target=` +
@@ -3496,7 +3943,9 @@ export function buildOpenCodeInteractionGuidance(
   // OpenCode list, and narrates "No CreatePlan MCP tool is available" even
   // though the provider bridges the native interaction.
   instructions.push(
-    "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). Raise it normally; the provider writes the plan under the host's calculated plans directory and handles execution approval. Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool.",
+    names.has("cursor_plan_stage")
+      ? "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). Raise it normally. The host stage tool waits for the host plan review and does not return until the user accepts or declines. Do not call `plan_exit` to submit or skip that review, and do not implement until that tool returns success. Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool. When the task will need a user-approved plan, record the first version as soon as its shape is clear, then keep investigating: refining afterward is expected and follow-up plans cost nothing extra. Do not defer the first plan until investigation is complete."
+      : "- Cursor-native CreatePlan is accepted as a Cursor interaction (not an OpenCode or MCP catalog tool). Raise it normally; the provider writes the plan under the host's calculated plans directory and handles execution approval. Do not narrate that CreatePlan is missing, unavailable, or not an MCP tool. When the task will need a user-approved plan, record the first version as soon as its shape is clear, then keep investigating: refining afterward is expected and follow-up plans cost nothing extra. Do not defer the first plan until investigation is complete.",
   )
   if (names.has("plan_enter")) {
     instructions.push(
@@ -3810,8 +4259,15 @@ export function spanEndParts(opts: {
   return out
 }
 
+/** UTF-16 name order for the first catalog freeze and for newcomers only. */
 function toolsInFixedOrder<T extends { name?: string }>(tools: readonly T[]): T[] {
-  return tools.map((tool) => ({ ...tool })).sort((left, right) => (left.name ?? "").localeCompare(right.name ?? ""))
+  return tools
+    .map((tool) => ({ ...tool }))
+    .sort((left, right) => {
+      const a = left.name ?? ""
+      const b = right.name ?? ""
+      return a < b ? -1 : a > b ? 1 : 0
+    })
 }
 
 /** Exported for tests — false for compaction/summary (no tools) and toolChoice none. */
@@ -3830,38 +4286,60 @@ export async function resolveTurnToolState(input: {
   abortSignal?: AbortSignal
 }): Promise<{ advertisedTools: OpencodeToolDef[]; allowTools: boolean }> {
   const { sessionKey, incomingTools, isCompaction } = input
-  if (sessionKey && incomingTools.length > 0) {
-    rememberToolCatalog(sessionKey, toolsInFixedOrder(incomingTools))
-  }
 
   // Advertisement and permission are deliberately independent.
   //
   // Advertisement must stay byte-stable across every Run of a conversation or
-  // the RequestContext changes shape and Cursor's prompt cache goes cold. A
-  // zero-tool call is never a smaller catalog — it is a lifecycle turn
-  // (compaction, title generation, summarization) that OpenCode opens alongside
-  // the real one — so it re-advertises the last real catalog rather than
-  // collapsing the context to tools=0. A genuinely restricted turn still sends
-  // a non-empty set and is advertised verbatim.
+  // the RequestContext changes shape and Cursor's prompt cache goes cold.
+  //
+  // OpenCode V1 *does* shrink the catalog on plan (edit denied → tools dropped
+  // in request.ts resolveTools). Copying that into Cursor RequestContext costs
+  // the whole tools prefix. Prefer: keep the epoch's fullest catalog for
+  // advertisement; compute allowTools from what actually arrived this turn.
+  //
+  // A zero-tool call is never a smaller catalog — it is a lifecycle turn
+  // (compaction, title generation) that re-advertises the last real catalog.
+  // New tool names (MCP connect) append at the tail without rewriting
+  // descriptors already frozen. Equal name-sets and host shrinks keep the
+  // frozen advertisement and its order — schema/description churn must not
+  // retokenize tools, and inserting a name that sorts earlier than `z` must
+  // not reshuffle the prefix.
   //
   // On cold start the lifecycle Run may arrive before any catalog exists. For a
   // valid session key, wait until a sibling doStream publishes the first real
-  // catalog; cancellation is the only escape. Never time out to tools=[] and
-  // never invent or filter the enabled set.
-  //
-  // Permission is computed from what actually arrived, so those lifecycle turns
-  // still refuse execution and cannot duplicate the real turn's side effects.
+  // catalog; cancellation is the only escape.
   let advertisedTools: OpencodeToolDef[]
   if (incomingTools.length > 0) {
-    advertisedTools = toolsInFixedOrder(incomingTools)
+    if (sessionKey) {
+      const cached = toolCatalogBySession.get(sessionKey)
+      if (cached && cached.length > 0) {
+        const cachedNames = new Set(cached.map((tool) => tool.name))
+        const incomingNames = new Set(incomingTools.map((tool) => tool.name))
+        const hasNew = [...incomingNames].some((name) => !cachedNames.has(name))
+        if (hasNew) {
+          const newcomers = toolsInFixedOrder(
+            incomingTools.filter((tool) => !cachedNames.has(tool.name)),
+          )
+          const merged = [...cached, ...newcomers]
+          rememberToolCatalog(sessionKey, merged)
+          advertisedTools = merged
+        } else {
+          rememberToolCatalog(sessionKey, cached)
+          advertisedTools = cached
+        }
+      } else {
+        const initial = toolsInFixedOrder(incomingTools)
+        rememberToolCatalog(sessionKey, initial)
+        advertisedTools = initial
+      }
+    } else {
+      advertisedTools = toolsInFixedOrder(incomingTools)
+    }
   } else if (sessionKey) {
     const cached = toolCatalogBySession.get(sessionKey)
       ?? await waitForSiblingToolCatalog(sessionKey, input.abortSignal)
-    advertisedTools = toolsInFixedOrder(cached)
+    advertisedTools = cached
   } else {
-    // Without a session key there is no safe sibling-correlation key. Preserve
-    // the host's literal no-tool call rather than borrowing another session's
-    // catalog.
     advertisedTools = []
   }
   return {
@@ -3873,10 +4351,11 @@ export async function resolveTurnToolState(input: {
 export function resolveTurnConversationReset(input: {
   sessionKey?: string
   isCompaction: boolean
+  /** @deprecated Ignored — prompt identity never remints. Kept for call-site compat. */
   promptIdentity?: PromptIdentity
 }): {
   reset: boolean
-  reason?: "compaction" | "post-compaction-rebase" | "agent-change" | "system-prompt-change"
+  reason?: "compaction" | "post-compaction-rebase"
 } {
   const { sessionKey, isCompaction } = input
   if (isCompaction) {
@@ -3884,24 +4363,17 @@ export function resolveTurnConversationReset(input: {
     return { reset: true, reason: "compaction" }
   }
 
-  let promptChange: "agent-change" | "system-prompt-change" | undefined
+  // Diagnostics only: accept promptIdentity for remember without reminting.
   if (sessionKey && input.promptIdentity) {
-    const current = normalizePromptIdentity(input.promptIdentity)
     const previous = promptIdentityBySession.get(sessionKey)
-    if (previous && promptIdentityChanged(previous, current)) {
-      promptChange = current.hostAgent !== undefined && previous.hostAgent !== current.hostAgent
-        ? "agent-change"
-        : "system-prompt-change"
-    }
     rememberPromptIdentity(sessionKey, {
       ...previous,
-      ...current,
+      ...normalizePromptIdentity(input.promptIdentity),
     })
   }
   if (sessionKey && postCompactionRebaseBySession.delete(sessionKey)) {
     return { reset: true, reason: "post-compaction-rebase" }
   }
-  if (promptChange) return { reset: true, reason: promptChange }
   return { reset: false }
 }
 
@@ -3914,6 +4386,7 @@ export function resetTurnStateForTests(): void {
   postCompactionRebaseBySession.clear()
   promptIdentityBySession.clear()
   mirroredTodosBySession.clear()
+  resetContextEpochsForTests()
 }
 
 function extractUserText(lastUser: Record<string, unknown> | undefined): string {

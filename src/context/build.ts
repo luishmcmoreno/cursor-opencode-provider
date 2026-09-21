@@ -19,12 +19,15 @@ import { collectGit } from "./git.js"
 import { collectProjectLayout } from "./layout.js"
 import { buildEnv } from "./env.js"
 import { ensureOpencodeProjectDir } from "./paths.js"
+import { holdCapabilityOverlay } from "./overlay.js"
 import { traceRequestContextPaths } from "../debug.js"
 
 export type BuildRequestContextInput = {
   workspaceRoot: string
   tools?: OpencodeToolDef[]
   providerIdentifier?: string
+  /** When set, skills/subagents/plugins are epoch-held for this conversation. */
+  conversationId?: string
 }
 
 export const DYNAMIC_REQUEST_CONTEXT_KEYS = [
@@ -162,15 +165,28 @@ async function buildDynamicRequestContextFromDiscovery(
         `Delegate to the host-configured ${agent.name} subagent; its host instructions and tools apply.`,
     }
   })
+  const liveSkills = skills.map((s) => ({
+    id: s.name,
+    full_path: s.fullPath,
+    content: s.content,
+    description: s.description,
+  }))
+  const livePlugins = plugins.map((p) => ({
+    id: p.id,
+    line: `opencode-plugin:${p.source}:${p.id}`,
+  }))
+  const overlay = input.conversationId
+    ? holdCapabilityOverlay(input.conversationId, {
+        skills: liveSkills,
+        subagents: customSubagents,
+        plugins: livePlugins,
+      })
+    : { skills: liveSkills.map(({ full_path, content, description }) => ({ full_path, content, description })), subagents: customSubagents, plugins: livePlugins }
 
   const dynamic: Record<string, unknown> = {
     tools: flat,
-    agent_skills: skills.map((s) => ({
-      full_path: s.fullPath,
-      content: s.content,
-      description: s.description,
-    })),
-    custom_subagents: customSubagents,
+    agent_skills: overlay.skills,
+    custom_subagents: overlay.subagents,
     mcp_file_system_options: {
       enabled: true,
       // Cursor metadata root (mcps / agent-tools), not the git workspace.
@@ -193,10 +209,8 @@ async function buildDynamicRequestContextFromDiscovery(
     mcp_info_complete: true,
   }
 
-  if (plugins.length > 0) {
-    dynamic.hooks_additional_context = plugins
-      .map((p) => `opencode-plugin:${p.source}:${p.id}`)
-      .join("\n")
+  if (overlay.plugins.length > 0) {
+    dynamic.hooks_additional_context = overlay.plugins.map((p) => p.line).join("\n")
   }
 
   return dynamic

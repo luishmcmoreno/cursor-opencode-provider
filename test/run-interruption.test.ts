@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import {
+  checkpointBlobGraphConcern,
   checkpointBlobGraphRequiresRebase,
   extractPromptHistory,
   MAX_CHECKPOINT_BLOB_GRAPH_BYTES,
@@ -131,7 +132,7 @@ describe("interrupted Cursor Run handling", () => {
     expect(completed).toBe(true)
   })
 
-  it("rebases checkpoint graphs that are oversized or incomplete", () => {
+  it("never remints for oversized or incomplete checkpoint graphs (CLI soft-reuse)", () => {
     expect(checkpointBlobGraphRequiresRebase({
       count: 1,
       bytes: MAX_CHECKPOINT_BLOB_GRAPH_BYTES,
@@ -141,13 +142,32 @@ describe("interrupted Cursor Run handling", () => {
       count: 1,
       bytes: MAX_CHECKPOINT_BLOB_GRAPH_BYTES + 1,
       complete: true,
-    })).toBe(true)
+    })).toBe(false)
     expect(checkpointBlobGraphRequiresRebase({
       count: 0,
       bytes: 0,
       complete: false,
       fallbackReason: "missing referenced blob",
-    })).toBe(true)
+    })).toBe(false)
+  })
+
+  it("reports warn-only concerns for oversized or incomplete graphs", () => {
+    expect(checkpointBlobGraphConcern({
+      count: 1,
+      bytes: MAX_CHECKPOINT_BLOB_GRAPH_BYTES + 1,
+      complete: true,
+    })).toBe("oversized-checkpoint-graph")
+    expect(checkpointBlobGraphConcern({
+      count: 0,
+      bytes: 0,
+      complete: false,
+      fallbackReason: "missing referenced blob",
+    })).toBe("incomplete-checkpoint-graph")
+    expect(checkpointBlobGraphConcern({
+      count: 1,
+      bytes: 10,
+      complete: true,
+    })).toBeUndefined()
   })
 
   it("rejects iterator EOF without turn_ended instead of emitting a normal stop", async () => {

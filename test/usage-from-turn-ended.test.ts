@@ -312,10 +312,12 @@ describe("Cursor cache diagnostics", () => {
       "priorContext=40000 currentContext=45000 contextDelta=5000 " +
       "rawReadVsPriorContext=50.0% sameSizedCategoryTokens=10000 " +
       'categoryDelta={"system_prompt":0,"tools":0,"conversation":5000} ' +
+      "toolsCategoryChurn=none " +
       "requestContext=reused requestContextHash=0123456789abcdef " +
       "systemPromptHash=fedcba9876543210 systemPromptSent=false " +
       "checkpointUpdates=4 tokenDetailUpdates=3 " +
       "pumpPasses=2 steps=3/3 displayToolCalls=1 execRequests=5 " +
+      "createPlanInTurn=false switchModeInTurn=false " +
       "perModelCallCache=unavailable",
     )
   })
@@ -350,6 +352,90 @@ describe("Cursor cache diagnostics", () => {
     expect(line).toContain("rawReadVsPriorContext=n/a")
     expect(line).toContain("sameSizedCategoryTokens=unavailable")
     expect(line).toContain("categoryDelta=unavailable")
+    expect(line).toContain("toolsCategoryChurn=none")
     expect(line).toContain("systemPromptSent=true")
+  })
+
+  it("flags upstream tools-category churn when the request-context overlay was reused", () => {
+    const line = formatCursorCacheDiagnostics(
+      {
+        inputTokens: 50_000,
+        outputTokens: 1_000,
+        cacheRead: 25_000,
+        cacheWrite: 0,
+        reasoningTokens: 0,
+      },
+      {
+        usedTokens: 27_000,
+        maxTokens: 256_000,
+        breakdown: {
+          totalUsedTokens: 27_000,
+          maxTokens: 256_000,
+          categories: [
+            { id: "system_prompt", label: "System Prompt", estimatedTokens: 1_000 },
+            { id: "tools", label: "Tools", estimatedTokens: 9_633 },
+            { id: "conversation", label: "Conversation", estimatedTokens: 16_367 },
+          ],
+        },
+      },
+      {
+        usedTokens: 24_000,
+        maxTokens: 256_000,
+        breakdown: {
+          totalUsedTokens: 24_000,
+          maxTokens: 256_000,
+          categories: [
+            { id: "system_prompt", label: "System Prompt", estimatedTokens: 1_000 },
+            { id: "tools", label: "Tools", estimatedTokens: 9_000 },
+            { id: "conversation", label: "Conversation", estimatedTokens: 14_000 },
+          ],
+        },
+      },
+      {
+        conversationId: "conversation-tools-churn",
+        startedWithCheckpoint: true,
+        requestContextReused: true,
+        requestContextHash: "abc",
+        checkpointUpdates: 2,
+        tokenDetailUpdates: 2,
+        pumpPasses: 1,
+        stepStarts: 1,
+        stepCompletes: 1,
+        displayToolCalls: 1,
+        execRequests: 1,
+      },
+    )
+    expect(line).toContain("toolsCategoryChurn=upstream-stable-overlay")
+    expect(line).toContain('"tools":633')
+  })
+
+  it("tags Runs where CreatePlan or SwitchMode ran in-turn", () => {
+    const line = formatCursorCacheDiagnostics(
+      {
+        inputTokens: 50_000,
+        outputTokens: 1_000,
+        cacheRead: 25_000,
+        cacheWrite: 0,
+        reasoningTokens: 0,
+      },
+      current,
+      undefined,
+      {
+        conversationId: "conversation-plan-switch-tags",
+        startedWithCheckpoint: false,
+        requestContextReused: false,
+        requestContextHash: "abc",
+        checkpointUpdates: 1,
+        tokenDetailUpdates: 1,
+        pumpPasses: 1,
+        stepStarts: 1,
+        stepCompletes: 1,
+        displayToolCalls: 1,
+        execRequests: 1,
+        createPlanInTurn: true,
+        switchModeInTurn: true,
+      },
+    )
+    expect(line).toContain("createPlanInTurn=true switchModeInTurn=true")
   })
 })

@@ -82,11 +82,24 @@ const TOOL_CALL_VARIANTS = Object.keys(VARIANT_TO_OPENCODE)
 // Cursor todo merges). Data-returning, interactive, and side-effecting calls
 // must use an exec/interaction request channel where Cursor can receive their
 // actual result.
+//
+// `get_mcp_tools_tool_call` is Cursor-native discovery (prompt name
+// GetDynamicTools when dynamic namespaces are on). The agent executes it
+// server-side after mcp_state; oversized catalogs spill through write_args.
 const DISPLAY_STATE_MIRROR_VARIANTS = new Set([
   "update_todos_tool_call",
   "read_todos_tool_call",
   "create_plan_tool_call",
 ])
+
+const NATIVE_DISPLAY_VARIANTS = new Set([
+  "get_mcp_tools_tool_call",
+])
+
+/** Display variants Cursor executes itself (mcp_state + optional write spill). */
+export function isNativeDisplayToolCall(variant: string): boolean {
+  return NATIVE_DISPLAY_VARIANTS.has(variant)
+}
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
@@ -514,6 +527,7 @@ export function resolveBridgedOpenCodeToolCall(
   display: DisplayToolCall,
   advertised: Iterable<string>,
 ): BridgedOpenCodeToolCall | undefined {
+  if (isNativeDisplayToolCall(display.variant)) return undefined
   if (!DISPLAY_STATE_MIRROR_VARIANTS.has(display.variant)) return undefined
   if (display.bridgeable === false) return undefined
   const names = new Set([...advertised].filter(Boolean))

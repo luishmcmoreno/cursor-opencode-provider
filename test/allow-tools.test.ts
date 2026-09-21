@@ -137,17 +137,96 @@ describe("compaction tool catalog", () => {
     })
   })
 
-  it("advertises a genuinely restricted catalog verbatim", async () => {
-    const full = [{ name: "read" }, { name: "write" }, { name: "bash" }]
-    const restricted = [{ name: "read" }]
+  it("keeps epoch catalog when host shrinks tools (plan denies edit)", async () => {
+    const full = [{ name: "bash" }, { name: "read" }, { name: "write" }]
+    const planRestricted = [{ name: "read" }]
     await resolveTurnToolState({ sessionKey: "ses_restricted", incomingTools: full, isCompaction: false })
 
-    // A non-empty smaller set is a real restriction, never a lifecycle signal.
+    // OpenCode plan filters edit tools out of the request catalog. Advertising
+    // that shrink to Cursor would retokenize RequestContext — keep the epoch
+    // catalog; allowTools still follows the current turn.
     expect(await resolveTurnToolState({
       sessionKey: "ses_restricted",
-      incomingTools: restricted,
+      incomingTools: planRestricted,
       isCompaction: false,
-    })).toEqual({ advertisedTools: restricted, allowTools: true })
+    })).toEqual({ advertisedTools: full, allowTools: true })
+  })
+
+  it("grows the epoch catalog when new tool names appear", async () => {
+    await resolveTurnToolState({
+      sessionKey: "ses_grow",
+      incomingTools: [{ name: "read" }],
+      isCompaction: false,
+    })
+    expect(await resolveTurnToolState({
+      sessionKey: "ses_grow",
+      incomingTools: [{ name: "bash" }, { name: "read" }],
+      isCompaction: false,
+    })).toEqual({
+      advertisedTools: [{ name: "read" }, { name: "bash" }],
+      allowTools: true,
+    })
+  })
+
+  it("appends multiple new names in UTF-16 order at the tail", async () => {
+    await resolveTurnToolState({
+      sessionKey: "ses_append_batch",
+      incomingTools: [{ name: "write" }],
+      isCompaction: false,
+    })
+    expect(await resolveTurnToolState({
+      sessionKey: "ses_append_batch",
+      incomingTools: [{ name: "write" }, { name: "read" }, { name: "bash" }],
+      isCompaction: false,
+    })).toEqual({
+      advertisedTools: [{ name: "write" }, { name: "bash" }, { name: "read" }],
+      allowTools: true,
+    })
+  })
+
+  it("holds first-catalog order when the host reshuffles the same names", async () => {
+    const first = await resolveTurnToolState({
+      sessionKey: "ses_reshuffle",
+      incomingTools: [{ name: "write" }, { name: "bash" }, { name: "read" }],
+      isCompaction: false,
+    })
+    expect(first.advertisedTools.map((tool) => tool.name)).toEqual(["bash", "read", "write"])
+    expect(await resolveTurnToolState({
+      sessionKey: "ses_reshuffle",
+      incomingTools: [{ name: "read" }, { name: "write" }, { name: "bash" }],
+      isCompaction: false,
+    })).toEqual(first)
+  })
+
+  it("keeps frozen descriptors when the name set is unchanged", async () => {
+    const original = [{ name: "read", description: "v1", inputSchema: { type: "object" } }]
+    await resolveTurnToolState({
+      sessionKey: "ses_same_names",
+      incomingTools: original,
+      isCompaction: false,
+    })
+    expect(await resolveTurnToolState({
+      sessionKey: "ses_same_names",
+      incomingTools: [{ name: "read", description: "v2", inputSchema: { type: "string" } }],
+      isCompaction: false,
+    })).toEqual({ advertisedTools: original, allowTools: true })
+  })
+
+  it("merges new names without rewriting existing descriptors", async () => {
+    const original = [{ name: "read", description: "v1" }]
+    await resolveTurnToolState({
+      sessionKey: "ses_grow_hold",
+      incomingTools: original,
+      isCompaction: false,
+    })
+    expect(await resolveTurnToolState({
+      sessionKey: "ses_grow_hold",
+      incomingTools: [{ name: "bash", description: "shell" }, { name: "read", description: "v2" }],
+      isCompaction: false,
+    })).toEqual({
+      advertisedTools: [{ name: "read", description: "v1" }, { name: "bash", description: "shell" }],
+      allowTools: true,
+    })
   })
 
   it("rebases after the summary checkpoint, restores execution, then stays stable", async () => {
@@ -189,15 +268,14 @@ describe("compaction tool catalog", () => {
       .toEqual({ reset: false })
   })
 
-  it("rebases checkpoints when the host agent or stable system prompt changes", () => {
+  it("keeps sticky conversation across host agent or system prompt hash changes", () => {
     const sessionKey = "ses_prompt_identity"
     expect(resolveTurnConversationReset({
       sessionKey,
       isCompaction: false,
       promptIdentity: { hostAgent: "build", systemPromptHash: "prompt-a" },
     })).toEqual({ reset: false })
-    // Title/generate lifecycle calls deliberately omit promptIdentity. Their
-    // reduced or rewritten prompt must not replace the primary cache identity.
+    // Title/generate lifecycle calls deliberately omit promptIdentity.
     expect(resolveTurnConversationReset({
       sessionKey,
       isCompaction: false,
@@ -207,21 +285,18 @@ describe("compaction tool catalog", () => {
       isCompaction: false,
       promptIdentity: { hostAgent: "build", systemPromptHash: "prompt-a" },
     })).toEqual({ reset: false })
-    expect(resolveTurnConversationReset({
-      sessionKey,
-      isCompaction: false,
-      promptIdentity: { hostAgent: "build", systemPromptHash: "prompt-a" },
-    })).toEqual({ reset: false })
+    // Agent flip must not remint (CLI keeps agentId across mode changes).
     expect(resolveTurnConversationReset({
       sessionKey,
       isCompaction: false,
       promptIdentity: { hostAgent: "plan", systemPromptHash: "prompt-a" },
-    })).toEqual({ reset: true, reason: "agent-change" })
+    })).toEqual({ reset: false })
+    // Remint path ignores promptIdentity entirely (hash is frozen separately).
     expect(resolveTurnConversationReset({
       sessionKey,
       isCompaction: false,
       promptIdentity: { hostAgent: "plan", systemPromptHash: "prompt-b" },
-    })).toEqual({ reset: true, reason: "system-prompt-change" })
+    })).toEqual({ reset: false })
   })
 
   it("bounds cached tool catalogs and pending post-compaction rebases", async () => {

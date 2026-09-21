@@ -9,7 +9,7 @@
  * and fall back to prose instead of ever calling the advertised host tool.
  *
  * Every rule below mirrors Cursor CLI, decompiled at
- * `~/Projects/cursor-mock-server/cursor/cli{,-local}`:
+ * `<cursor-cli-checkout>/cursor/cli{,-local}`:
  *
  * - `src/utils/interaction-utils.ts` — `BU` (freeform option id), `Q7` (display
  *   options), `iX` (selection → success), `N$` (rejection + default reason).
@@ -261,19 +261,18 @@ export function asyncResult(): AskQuestionResultMessage {
 }
 
 /**
- * Pull each question's answer text out of OpenCode's `question` tool output.
+ * Pull each question's answer text out of a host `question` tool output.
  *
- * The tool returns prose, not structured data (`metadata.answers` does not
- * cross the AI SDK boundary):
+ * OpenCode returns prose (`metadata.answers` does not cross the AI SDK
+ * boundary):
  *
  *   User has answered your questions: "<q1>"="<a, b>", "<q2>"="Unanswered". You
  *   can now continue with the user's answers in mind.
  *
- * The provider authored the question strings, so each answer is located by its
- * own `"<question>"="` anchor scanning forward — robust against commas, quotes
- * and `"="` inside question or answer text, and against duplicate questions.
- * Returns undefined for a question whose anchor is absent, which is treated as
- * unanswered rather than guessed at.
+ * The prose is located by its `"<question>"="` anchor — robust
+ * against commas, quotes and `"="` inside question or answer text, and against
+ * duplicate questions. Returns undefined for a question whose anchor is
+ * absent, which is treated as unanswered rather than guessed at.
  */
 export function parseAnswerSegments(
   questions: readonly CursorAskQuestionItem[],

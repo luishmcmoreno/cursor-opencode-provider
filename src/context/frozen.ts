@@ -5,6 +5,12 @@ import {
   requestContextBase,
   type BuildRequestContextInput,
 } from "./build.js"
+import { clearContextEpoch, endContextEpoch, resetContextEpochsForTests } from "./epoch.js"
+import {
+  clearOverlayHold,
+  resetOverlayHoldsForTests,
+  transferOverlayHold,
+} from "./overlay.js"
 import { trace } from "../debug.js"
 import { encodeMessage } from "../protocol/messages.js"
 
@@ -15,10 +21,10 @@ import { encodeMessage } from "../protocol/messages.js"
  * base plus live plugin/tool overlays. Rebuilding volatile git/layout data on
  * every Run shifts the prompt prefix and tanks prompt-cache hits.
  *
- * Skills, subagents, plugin metadata, and tool/MCP capabilities are rebuilt on
- * each Run and overlaid on that base. If their encoded bytes did not change,
- * the exact prior materialized object is reused. This matches Cursor's newer
- * baked-context + live-overlay design without retaining stale capabilities.
+ * Skills, subagents, plugin metadata, and tool/MCP capabilities are rediscovered
+ * each Run, then epoch-held (equal ids keep frozen bytes; new ids append) and
+ * overlaid on that base. If the encoded overlay bytes did not change, the exact
+ * prior materialized object is reused.
  */
 
 const byConversationId = new Map<string, Record<string, unknown>>()
@@ -50,6 +56,7 @@ function remember(conversationId: string, context: Record<string, unknown>): voi
     if (!oldest) break
     byConversationId.delete(oldest)
     materializedByConversationId.delete(oldest)
+    clearOverlayHold(oldest)
   }
 }
 
@@ -78,6 +85,8 @@ export function setFrozenRequestContext(
 export function clearFrozenRequestContext(conversationId: string): void {
   byConversationId.delete(conversationId)
   materializedByConversationId.delete(conversationId)
+  clearOverlayHold(conversationId)
+  clearContextEpoch(conversationId)
 }
 
 /**
@@ -86,7 +95,8 @@ export function clearFrozenRequestContext(conversationId: string): void {
  * Compaction changes Cursor's state/checkpoint identity, not the OpenCode
  * workspace. Preserve the expensive base and the prior materialized bytes as a
  * comparison seed; getOrBuildRequestContext still rediscovers live capability
- * overlays and only reuses the complete context when those bytes also match.
+ * overlays (then epoch-holds them) and only reuses the complete context when
+ * those bytes also match.
  */
 export function transferFrozenRequestContext(
   previousConversationId: string,
@@ -95,8 +105,16 @@ export function transferFrozenRequestContext(
   if (!previousConversationId || !nextConversationId) return false
   const base = byConversationId.get(previousConversationId)
   const materialized = materializedByConversationId.get(previousConversationId)
-  clearFrozenRequestContext(previousConversationId)
-  clearFrozenRequestContext(nextConversationId)
+  // System Context epoch does not transfer — compaction starts a fresh baseline.
+  // Overlay hold does transfer: same workspace, same advertised skill/agent/plugin
+  // bytes, so the comparison seed can still match. clearFrozenRequestContext
+  // also drops epoch state for each id.
+  endContextEpoch(previousConversationId, nextConversationId)
+  transferOverlayHold(previousConversationId, nextConversationId)
+  byConversationId.delete(previousConversationId)
+  materializedByConversationId.delete(previousConversationId)
+  byConversationId.delete(nextConversationId)
+  materializedByConversationId.delete(nextConversationId)
   if (!base) return false
   remember(nextConversationId, base)
   if (materialized) {
@@ -113,6 +131,8 @@ export function resetFrozenRequestContextsForTests(): void {
   byConversationId.clear()
   materializedByConversationId.clear()
   buildsByConversationId.clear()
+  resetOverlayHoldsForTests()
+  resetContextEpochsForTests()
 }
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -140,17 +160,20 @@ function rememberMaterialized(
 
 /**
  * Return a stable-base + live-overlay RequestContext for `conversationId`.
- * The base is built once; capability sections are rediscovered every Run.
+ * The base is built once; capability sections are rediscovered every Run
+ * and then epoch-held.
  */
 export async function getOrBuildRequestContext(
   conversationId: string,
   input: BuildRequestContextInput,
   opts?: { refresh?: boolean },
 ): Promise<{ context: Record<string, unknown>; reused: boolean }> {
+  const scoped = conversationId ? { ...input, conversationId } : input
+  if (opts?.refresh && conversationId) clearOverlayHold(conversationId)
   if (!opts?.refresh && conversationId) {
     const base = getFrozenRequestContext(conversationId)
     if (base) {
-      const dynamic = await buildDynamicRequestContext(input)
+      const dynamic = await buildDynamicRequestContext(scoped)
       const materialized = rememberMaterialized(
         conversationId,
         materializeRequestContext(base, dynamic),
@@ -171,11 +194,11 @@ export async function getOrBuildRequestContext(
     const inFlight = buildsByConversationId.get(conversationId)
     if (inFlight) {
       await inFlight
-      return getOrBuildRequestContext(conversationId, input)
+      return getOrBuildRequestContext(conversationId, scoped)
     }
   }
 
-  const build = buildRequestContext(input)
+  const build = buildRequestContext(scoped)
   if (conversationId) buildsByConversationId.set(conversationId, build)
   let context: Record<string, unknown>
   try {

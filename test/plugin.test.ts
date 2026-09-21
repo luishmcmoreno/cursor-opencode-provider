@@ -16,6 +16,10 @@ import {
 } from "../src/shell-timeout.js"
 import { sessionActivity } from "../src/activity.js"
 import * as rootExports from "../src/index.js"
+import {
+  hasPlanExecutionKickoff,
+  resetPlanExecutionKickoffForTests,
+} from "../src/plan-execution-kickoff.js"
 
 // Characters safeLabel must remove from emitted names/keys (issue #2).
 const INVALID = new RegExp("[()<>&\"'`]")
@@ -24,6 +28,18 @@ const variantParams = (params: Array<{ id: string; value: string }>) => ({
 })
 
 describe("package root exports", () => {
+  it("installs plan kickoff only when the host exposes session.promptAsync", async () => {
+    resetPlanExecutionKickoffForTests()
+    await CursorPlugin({} as any)
+    expect(hasPlanExecutionKickoff()).toBe(false)
+
+    await CursorPlugin({
+      client: { session: { promptAsync: async () => ({ data: undefined }) } },
+    } as any)
+    expect(hasPlanExecutionKickoff()).toBe(true)
+    resetPlanExecutionKickoffForTests()
+  })
+
   it("loads classic tools from a Windows absolute host path", async () => {
     const { loadClassicTools } = await import("../src/plugin.js")
     const seen: string[] = []

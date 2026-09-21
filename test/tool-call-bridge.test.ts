@@ -7,6 +7,7 @@ import {
   extractExecDisplayCallId,
   extractProtobufSubmessage,
   listProtobufFieldNumbers,
+  isNativeDisplayToolCall,
   parseDisplayToolCall,
   resolveBridgedOpenCodeToolCall,
   snapshotMirroredTodos,
@@ -720,6 +721,7 @@ describe("tool-call-bridge", () => {
       expect(display, c.variant).toBeDefined()
       expect(display!.variant, c.variant).toBe(c.variant)
       expect(display!.preferredToolName, c.variant).toBe(c.preferred)
+      expect(isNativeDisplayToolCall(c.variant), c.variant).toBe(c.variant === "get_mcp_tools_tool_call")
       const bridged = resolveBridgedOpenCodeToolCall(display!, c.advertised)
       if (
         c.variant === "update_todos_tool_call" ||
@@ -758,7 +760,10 @@ describe("tool-call-bridge", () => {
       ["generate_image_tool_call", { args: { description: "img" } }],
       ["web_fetch_tool_call", { args: { url: "https://example.com" } }],
       ["await_tool_call", { args: { task_id: "t1" } }],
-      ["get_mcp_tools_tool_call", { args: { tool_name: "edit" } }],
+      ["get_mcp_tools_tool_call", {
+        args: { tool_name: "edit" },
+        result: { success: { content: "{}", output_file_path: "/tmp/agent-tools/a.txt" } },
+      }],
       ["pi_read_tool_call", { args: { path: "/tmp/a" } }],
       ["pi_bash_tool_call", { args: { command: "echo", timeout: 1.5 } }],
       ["pi_edit_tool_call", {
@@ -775,6 +780,30 @@ describe("tool-call-bridge", () => {
       const display = parseDisplayToolCall(`id_${variant}`, decoded)
       expect(display?.variant, variant).toBe(variant)
     }
+  })
+
+  it("round-trips GetMcpToolsToolCall result content and output_file_path", () => {
+    const encoded = encodeMessage("ToolCall", {
+      tool_call_id: "mcp-tools-1",
+      get_mcp_tools_tool_call: {
+        args: { server: "opencode" },
+        result: {
+          success: {
+            content: '{"mode":"catalog"}',
+            output_file_path: "/tmp/agent-tools/spill.txt",
+          },
+        },
+      },
+    })
+    const decoded = decodeMessage<any>("ToolCall", encoded)
+    expect(decoded.get_mcp_tools_tool_call.args.server).toBe("opencode")
+    expect(decoded.get_mcp_tools_tool_call.result.success).toEqual({
+      content: '{"mode":"catalog"}',
+      output_file_path: "/tmp/agent-tools/spill.txt",
+    })
+    const display = parseDisplayToolCall("mcp-tools-1", decoded)
+    expect(display?.preferredToolName).toBe("get_mcp_tools")
+    expect(resolveBridgedOpenCodeToolCall(display!, ["write", "bash"])).toBeUndefined()
   })
 
 

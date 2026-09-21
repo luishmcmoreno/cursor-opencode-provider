@@ -84,21 +84,29 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
   const apiBaseURL = cursorApiBaseURL()
   const classicTools = await loadClassicTools()
 
-  // After CreatePlan Yes, queue OpenCode's plan_exit-shaped synthetic turn so
-  // implementation starts. Failures stay in the kickoff module (trace only).
-  setPlanExecutionKickoff(async ({ sessionID, planPath }) => {
-    await input.client.session.promptAsync({
-      path: { id: sessionID },
-      body: {
-        agent: "build",
-        parts: [{
-          type: "text",
-          text: createPlanExecutionKickoffText(planPath),
-          synthetic: true,
-        }],
-      },
-    })
-  })
+  // Install the OpenCode plan-exit-shaped kickoff only when the OpenCode client
+  // exposes that structural API. Without it, no synthetic kickoff is registered.
+  const sessionClient = (input as unknown as {
+    client?: { session?: { promptAsync?: (args: unknown) => Promise<unknown> } }
+  }).client?.session
+  const promptAsync = sessionClient?.promptAsync
+  setPlanExecutionKickoff(
+    typeof promptAsync === "function"
+      ? async ({ sessionID, planPath }) => {
+          await promptAsync.call(sessionClient, {
+            path: { id: sessionID },
+            body: {
+              agent: "build",
+              parts: [{
+                type: "text",
+                text: createPlanExecutionKickoffText(planPath),
+                synthetic: true,
+              }],
+            },
+          })
+        }
+      : undefined,
+  )
 
   // Last access token successfully resolved in this plugin instance. Config's
   // loadModels can only read OpenCode's durable store (auth.json /

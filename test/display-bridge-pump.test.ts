@@ -801,9 +801,9 @@ describe("display-only ToolCall pump bridge", () => {
   })
 
   it("bridges a merge without final state when the Run already has a mirrored prior", async () => {
-    // Regression for the omp stuck-todo path: Cursor often sends merge:true
-    // with only the patch and no success.todos. The pump must expand against
-    // session.mirroredTodos and emit a replace-all todowrite.
+    // Cursor often sends merge:true with only the patch and no success.todos.
+    // Expand against session.mirroredTodos and emit a replace-all todowrite so
+    // completions still land on the host.
     const writes: Uint8Array[] = []
     const parts: any[] = []
     const callId = "todos-merge-from-prior"
@@ -949,6 +949,44 @@ describe("display-only ToolCall pump bridge", () => {
 
     expect(parts.some((p) => p.type === "finish")).toBe(true)
     expect(parts.some((p) => p.type === "tool-call")).toBe(false)
+  })
+
+  it("does not replay GetMcpTools display completions as a host tool", async () => {
+    const writes: Uint8Array[] = []
+    const parts: any[] = []
+    const callId = "get-mcp-tools-1"
+    const toolCall = {
+      get_mcp_tools_tool_call: {
+        args: { server: "opencode" },
+        result: {
+          success: {
+            content: '{"note":"Large output has been written to: /tmp/agent-tools/a.txt","filePath":"/tmp/agent-tools/a.txt"}',
+            output_file_path: "/tmp/agent-tools/a.txt",
+          },
+        },
+      },
+    }
+    const session = fakeSession(
+      [
+        displayPayload("started", callId, toolCall),
+        displayPayload("completed", callId, toolCall),
+        turnEndedPayload(),
+      ],
+      writes,
+    )
+    const controller = {
+      enqueue(part: unknown) {
+        parts.push(part)
+      },
+      error() {},
+    } as ReadableStreamDefaultController<any>
+
+    await pump(session, controller, { textId: "text", reasoningId: "reasoning" })
+
+    expect(parts.some((p) => p.type === "tool-call")).toBe(false)
+    expect(parts.some((p) => p.type === "finish")).toBe(true)
+    expect(session.displayToolCalls.size).toBe(0)
+    expect(session.pending.size).toBe(0)
   })
 
   it("soft-denies a known unsupported exec variant and keeps the Run alive", async () => {

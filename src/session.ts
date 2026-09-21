@@ -211,6 +211,8 @@ export type CursorSession = {
     stepCompletes: number
     displayToolCalls: number
     execRequests: number
+    createPlanInTurn?: boolean
+    switchModeInTurn?: boolean
   }
   /** OpenCode session whose own or descendant activity renews tool leases. */
   openCodeSessionId?: string
@@ -263,6 +265,12 @@ export type CursorSession = {
    * stream instead of emitting tool-call parts OpenCode will reject.
    */
   allowTools: boolean
+  /**
+   * Host-enabled tool names for *this* Run (what actually arrived). May be a
+   * subset of the epoch advertisement when plan denies edit — advertise fully
+   * for cache stability, but refuse exec outside this set.
+   */
+  permittedToolNames?: ReadonlySet<string>
   /**
    * Best-effort held-Run activity counters used only for diagnostics. Displayed
    * AI SDK usage comes from checkpoint occupancy (tool steps) and TurnEnded
@@ -388,12 +396,31 @@ export class SessionManager {
               `— leaving it to finish or expire naturally instead of interrupting it`,
           )
         } else {
-          trace(
-            `sessionManager.registerSession: superseding stale session ${prior.sessionId} ` +
-              `(openCodeSessionId=${session.openCodeSessionId}, pending=${prior.pending.size}) ` +
-              `with new session ${session.sessionId}`,
-          )
-          this.close(prior, "superseded-by-new-run")
+          // Display-only bridged pendings do not need a Cursor exec write — settle
+          // them first so a todowrite-only prior can still be superseded cleanly.
+          const settled = this.settleBridgedPending(prior)
+          if (settled > 0) {
+            trace(
+              `sessionManager.registerSession: settled ${settled} bridged pending on prior ` +
+                `session ${prior.sessionId} before supersede`,
+            )
+          }
+          if (prior.pending.size > 0) {
+            // Real execs still outstanding — preparePriorSessionForFreshTurn should
+            // have cancelled + drained. Do not mid-exec supersede.
+            trace(
+              `sessionManager.registerSession: openCodeSessionId=${session.openCodeSessionId} ` +
+                `has prior session ${prior.sessionId} with ${prior.pending.size} still-pending ` +
+                `exec(s) — refusing supersede; leaving held Run for cancel/drain/continuation`,
+            )
+          } else {
+            trace(
+              `sessionManager.registerSession: superseding stale session ${prior.sessionId} ` +
+                `(openCodeSessionId=${session.openCodeSessionId}, pending=${prior.pending.size}) ` +
+                `with new session ${session.sessionId}`,
+            )
+            this.close(prior, "superseded-by-new-run")
+          }
         }
       }
       this.byOpenCodeSessionId.set(session.openCodeSessionId, session)
@@ -402,28 +429,69 @@ export class SessionManager {
     this.subscribeTerminal(session)
   }
 
+  /** Live open Run for this OpenCode session id, if any. */
+  findOpenByOpenCodeSessionId(openCodeSessionId: string | undefined): CursorSession | undefined {
+    if (!openCodeSessionId) return undefined
+    const session = this.byOpenCodeSessionId.get(openCodeSessionId)
+    return session && !session.closed ? session : undefined
+  }
+
+  isActivelyPumping(session: CursorSession): boolean {
+    return this.isPumping(session)
+  }
+
+  /**
+   * Clear display-only bridged pendings that do not require a Cursor exec write.
+   * Used when the host starts a fresh user turn instead of returning the bridged
+   * tool result (e.g. human `continue` while a todowrite mirror is outstanding).
+   *
+   * @returns number of bridged pendings settled
+   */
+  settleBridgedPending(session: CursorSession): number {
+    if (session.closed) return 0
+    let settled = 0
+    for (const [execId, pending] of [...session.pending.entries()]) {
+      if (!pending.bridged) continue
+      if (pending.state === "claimed") continue
+      const key = this.key(session.sessionId, execId)
+      this.putTombstone(key, "delivered")
+      session.pending.delete(execId)
+      this.byExecId.delete(key)
+      settled++
+    }
+    if (settled > 0) {
+      if (session.pending.size === 0) this.recordSemanticProgress(session)
+      this.scheduleHardDeadline(session)
+    }
+    return settled
+  }
+
   private isPumping(session: CursorSession): boolean {
     return session.pumpOwner != null || session.pumpActive
   }
 
   /**
    * Force-close the oldest idle open session(s) once registration exceeds the
-   * cap. Never closes a session with a live pull() mid-await (see the same
-   * guard in the supersede check above) — an unclosable backlog of genuinely
-   * active sessions just means the cap can't be enforced until one finishes.
+   * cap. Never closes a session with a live pull() mid-await, or one still
+   * holding pending execs (continuation / fresh-turn cancel+drain owns those).
+   * An unclosable backlog of genuinely active sessions just means the cap
+   * can't be enforced until one finishes.
    */
   private enforceOpenSessionCap(justRegistered: CursorSession): void {
     while (this.sessions.size > this.maxOpenSessions) {
       let oldest: CursorSession | undefined
       for (const candidate of this.sessions) {
         if (candidate === justRegistered || this.isPumping(candidate)) continue
+        // Held-open Runs with pending tools must not be cap-evicted — that is
+        // mid-exec supersede by another name and throws away the prefix.
+        if (candidate.pending.size > 0) continue
         if (!oldest || candidate.createdAt < oldest.createdAt) oldest = candidate
       }
       if (!oldest) {
         trace(
           `sessionManager.registerSession: open session cap exceeded ` +
             `(${this.sessions.size} > ${this.maxOpenSessions}) but no idle session is ` +
-            `available to close — all remaining sessions are actively pumping`,
+            `available to close — all remaining sessions are pumping or held-pending`,
         )
         return
       }

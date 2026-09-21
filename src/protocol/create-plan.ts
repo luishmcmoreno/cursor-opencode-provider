@@ -132,9 +132,10 @@ export type CursorPlanStageInput = {
  * How a CreatePlan query is satisfied this turn. Keyed only on the advertised
  * catalog and the provider's own plan-mode state — never on host identity.
  *
- * - `stage`   a host plan-stage tool is advertised; the host writes the plan
- *             *and* owns the execution-approval prompt, and its tool result is
- *             the approval outcome (success = approved, error = not approved).
+ * - `stage`   a host plan-stage tool is advertised; the host writes the plan.
+ *             Its tool result is the approval outcome (success = approved,
+ *             error = not approved). The result may name the host's own
+ *             follow-up approval call. This provider does not invent that prompt.
  * - `approve` no such tool, but the host advertises `question`: the provider
  *             writes the plan itself and then asks the same thing with upstream
  *             `PlanExitTool`'s own prompt.
@@ -203,7 +204,9 @@ function createPlanApprovalItem(question: string): CursorAskQuestionItem {
 }
 
 /** Host `question` input mirroring upstream `PlanExitTool`'s own prompt. */
-export function createPlanApprovalQuestionInput(planLabel: string): OpencodeQuestionInput {
+export function createPlanApprovalQuestionInput(
+  planLabel: string,
+): OpencodeQuestionInput {
   return {
     questions: [
       {
@@ -227,10 +230,8 @@ export function createPlanApprovalQuestionInput(planLabel: string): OpencodeQues
 /**
  * True when the emulated approval prompt came back as an explicit "Yes".
  * An unanswered, dismissed, or failed prompt keeps the model planning rather
- * than silently starting execution.
- *
- * `question` must be the exact prompt that was asked — the host echoes it back
- * verbatim, and it is the anchor the answer is parsed from.
+ * than silently starting execution. OpenCode prose is anchored on the exact
+ * prompt text. Every other result shape fails closed.
  */
 export function createPlanApproved(
   output: string,
@@ -239,7 +240,8 @@ export function createPlanApproved(
 ): boolean {
   if (isError) return false
   const [segment] = parseAnswerSegments([createPlanApprovalItem(question)], output)
-  return (segment ?? "").trim().toLowerCase() === CREATE_PLAN_APPROVAL_YES.toLowerCase()
+  const answer = (segment ?? "").trim().toLowerCase()
+  return answer === CREATE_PLAN_APPROVAL_YES.toLowerCase()
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

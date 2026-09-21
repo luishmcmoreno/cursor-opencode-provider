@@ -38,6 +38,18 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).not.toContain("`webfetch`")
   })
 
+  it("tells a staged plan to follow the host approval call", () => {
+    const guidance = buildOpenCodeInteractionGuidance([
+      { name: "cursor_plan_stage" },
+      { name: "plan_enter" },
+      { name: "plan_exit" },
+      { name: "write" },
+    ], false, "/workspace/project")
+    expect(guidance).toContain("waits for the host plan review")
+    expect(guidance).toContain("Do not call `plan_exit` to submit or skip")
+    expect(guidance).not.toContain("handles execution approval")
+  })
+
   it("uses native plan tools and collision-safe custom web aliases", () => {
     const guidance = buildOpenCodeInteractionGuidance([
       { name: "plan_enter" },

@@ -25,6 +25,10 @@ import {
   hydrateConversationState,
   persistConversationState,
 } from "../src/protocol/conversation-state.js"
+import {
+  resetTurnStateForTests,
+  resolveTurnToolState,
+} from "../src/language-model.js"
 
 function sha(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex")
@@ -87,6 +91,7 @@ describe("frozen request_context", () => {
     resetCheckpointsForTests()
     resetConversationBlobsForTests()
     resetConversationPersistenceForTests()
+    resetTurnStateForTests()
   })
 
   it("builds once then reuses the same object across calls", async () => {
@@ -197,6 +202,7 @@ describe("frozen request_context", () => {
   })
 
   it("reuses the prefix when the host enumerates the same tools in a different order", async () => {
+    const sessionKey = "ses-freeze-tool-order"
     const conversationId = "conv-freeze-tool-order"
     const tools = [
       { name: "read", description: "Read a file" },
@@ -207,10 +213,25 @@ describe("frozen request_context", () => {
       mcp: { github: { type: "remote" } },
     }))
     try {
-      const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
+      const firstState = await resolveTurnToolState({
+        sessionKey,
+        incomingTools: tools,
+        isCompaction: false,
+      })
+      const first = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        tools: firstState.advertisedTools,
+      })
+      const reorderedState = await resolveTurnToolState({
+        sessionKey,
+        incomingTools: [...tools].reverse(),
+        isCompaction: false,
+      })
+      expect(reorderedState.advertisedTools.map((tool) => tool.name))
+        .toEqual(firstState.advertisedTools.map((tool) => tool.name))
       const reordered = await getOrBuildRequestContext(conversationId, {
         workspaceRoot: root,
-        tools: [...tools].reverse(),
+        tools: reorderedState.advertisedTools,
       })
 
       expect(reordered.reused).toBe(true)
@@ -220,6 +241,40 @@ describe("frozen request_context", () => {
     } finally {
       await rm(path.join(root, "opencode.json"), { force: true })
     }
+  })
+
+  it("keeps existing tool descriptors when a name is appended", async () => {
+    const sessionKey = "ses-freeze-tool-append"
+    const conversationId = "conv-freeze-tool-append"
+    const firstState = await resolveTurnToolState({
+      sessionKey,
+      incomingTools: [{ name: "write", description: "Write a file" }],
+      isCompaction: false,
+    })
+    const first = await getOrBuildRequestContext(conversationId, {
+      workspaceRoot: root,
+      tools: firstState.advertisedTools,
+    })
+    const grownState = await resolveTurnToolState({
+      sessionKey,
+      incomingTools: [
+        { name: "bash", description: "Run a shell command" },
+        { name: "write", description: "Write a file" },
+      ],
+      isCompaction: false,
+    })
+    expect(grownState.advertisedTools.map((tool) => tool.name)).toEqual(["write", "bash"])
+    const grown = await getOrBuildRequestContext(conversationId, {
+      workspaceRoot: root,
+      tools: grownState.advertisedTools,
+    })
+
+    expect(grown.reused).toBe(false)
+    const firstTools = first.context.tools as Array<Record<string, unknown>>
+    const grownTools = grown.context.tools as Array<Record<string, unknown>>
+    expect(grownTools).toHaveLength(2)
+    expect(grownTools[0]).toEqual(firstTools[0])
+    expect(grownTools[1]?.tool_name).toBe("bash")
   })
 
   it("rebuilds a byte-identical prefix after durable restart hydration", async () => {
@@ -277,7 +332,7 @@ describe("frozen request_context", () => {
     expect(empty.context.tools).toEqual([])
   })
 
-  it("discovers skill additions and removals during a conversation", async () => {
+  it("discovers skill additions and holds removals during a conversation", async () => {
     const conversationId = "conv-live-skills"
     const skillDir = path.join(root, ".opencode", "skills", "live-skill")
     const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
@@ -293,16 +348,101 @@ describe("frozen request_context", () => {
     expect(added.reused).toBe(false)
     expect((added.context.agent_skills as Array<Record<string, unknown>>)
       .some((skill) => skill.description === "Added during chat")).toBe(true)
+    const addedSkills = added.context.agent_skills as Array<Record<string, unknown>>
+    expect(addedSkills[addedSkills.length - 1]?.description).toBe("Added during chat")
 
     const unchanged = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
     expect(unchanged.reused).toBe(true)
     expect(unchanged.context).toBe(added.context)
 
+    await writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: live-skill\ndescription: Edited during chat\n---\nChanged body.\n",
+    )
+    const edited = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    expect(edited.reused).toBe(true)
+    expect((edited.context.agent_skills as Array<Record<string, unknown>>)
+      .some((skill) => skill.description === "Added during chat")).toBe(true)
+    expect((edited.context.agent_skills as Array<Record<string, unknown>>)
+      .some((skill) => skill.description === "Edited during chat")).toBe(false)
+
     await rm(skillDir, { recursive: true, force: true })
     const removed = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(removed.reused).toBe(false)
+    expect(removed.reused).toBe(true)
     expect((removed.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.description === "Added during chat")).toBe(false)
+      .some((skill) => skill.description === "Added during chat")).toBe(true)
+  })
+
+  it("appends a skill that sorts earlier instead of inserting it", async () => {
+    const conversationId = "conv-skill-append"
+    const zebraDir = path.join(root, ".opencode", "skills", "zebra-skill")
+    const alphaDir = path.join(root, ".opencode", "skills", "alpha-skill")
+    await mkdir(zebraDir, { recursive: true })
+    await writeFile(
+      path.join(zebraDir, "SKILL.md"),
+      "---\nname: zebra-skill\ndescription: Zebra\n---\nZ.\n",
+    )
+    const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    const firstSkills = first.context.agent_skills as Array<Record<string, unknown>>
+    const zebraIndex = firstSkills.findIndex((skill) => skill.description === "Zebra")
+    expect(zebraIndex).toBeGreaterThanOrEqual(0)
+
+    await mkdir(alphaDir, { recursive: true })
+    await writeFile(
+      path.join(alphaDir, "SKILL.md"),
+      "---\nname: alpha-skill\ndescription: Alpha\n---\nA.\n",
+    )
+    const grown = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    const grownSkills = grown.context.agent_skills as Array<Record<string, unknown>>
+    expect(grown.reused).toBe(false)
+    expect(grownSkills.slice(0, firstSkills.length)).toEqual(firstSkills)
+    expect(grownSkills[grownSkills.length - 1]?.description).toBe("Alpha")
+    await rm(alphaDir, { recursive: true, force: true })
+    await rm(zebraDir, { recursive: true, force: true })
+  })
+
+  it("holds custom subagents when the host omits the executor", async () => {
+    const conversationId = "conv-hold-subagents"
+    const tools = [{
+      name: "task",
+      description: "Launch a subagent with subagent_type.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          prompt: { type: "string" },
+          subagent_type: { type: "string" },
+        },
+      },
+    }]
+    const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
+    const firstAgents = (first.context.custom_subagents as Array<Record<string, unknown>>)
+      .map((agent) => agent.name)
+    expect(firstAgents).toContain("general")
+    expect(firstAgents).toContain("explore")
+
+    const empty = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    expect(empty.reused).toBe(false)
+    expect((empty.context.custom_subagents as Array<Record<string, unknown>>)
+      .map((agent) => agent.name)).toEqual(firstAgents)
+    expect(empty.context.tools).toEqual([])
+  })
+
+  it("appends a plugin line at the tail instead of re-sorting", async () => {
+    const conversationId = "conv-plugin-append"
+    const pluginDir = path.join(root, ".opencode", "plugins")
+    await mkdir(pluginDir, { recursive: true })
+    await writeFile(path.join(pluginDir, "zeta.js"), "export {}")
+    const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    expect(first.context.hooks_additional_context).toBe("opencode-plugin:local:zeta")
+
+    await writeFile(path.join(pluginDir, "alpha.js"), "export {}")
+    const grown = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    expect(grown.reused).toBe(false)
+    expect(grown.context.hooks_additional_context).toBe(
+      "opencode-plugin:local:zeta\nopencode-plugin:local:alpha",
+    )
+    await rm(pluginDir, { recursive: true, force: true })
   })
 
   it("refreshes MCP server identity when configuration changes", async () => {

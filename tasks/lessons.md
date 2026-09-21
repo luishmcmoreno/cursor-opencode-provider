@@ -1,5 +1,11 @@
 # Lessons
 
+- Debug log re-init must append when `CURSOR_PROVIDER_DEBUG_FILE` already has
+  content. Truncating on every module load wipes mid-run `EMITTED` lines and
+  makes self-verify falsely fail ask/todo/task even though the host transcript
+  still has the calls (`reinit=append` marker). Operators truncate once before
+  a clean run. Separately, when the file reaches 10 MiB, `trace` size-caps it
+  (`debug: size-cap truncate`) so unbounded self-verify logs cannot fill disk.
 - Account-specific endpoint discovery should fail closed when the authoritative API lookup fails; silently substituting a legacy global endpoint can mask the real issue and route regional accounts to a host known to reject them.
 - Telemetry fields on API discovery calls should default to disabled and require an explicit provider config opt-in.
 - Keep API base URLs and agent Run host overrides as separate options; sharing one `baseURL` name makes it too easy to send the HTTP/2 Run stream to the API host.
@@ -20,6 +26,7 @@
 - A completed tool-display event is evidence that an operation already finished, not authority to execute it again. Only mirror self-contained final UI state; data, interaction answers, side effects, and failures require a request/reply channel.
 - Process-global session metadata needs a shared finite lifetime just like checkpoints and blobs. Bound tool catalogs, lifecycle markers, and conversation bindings, and evict their associated opaque state together.
 - Advertising a virtual MCP server also commits the provider to its control plane. Answer state/readiness probes from the exact advertised descriptor set before waiting for the eventual tool execution request, but validate each response against its canonical nested schema: MCP state uses full tool definitions even though request-context catalogs use narrower filesystem descriptors.
+- Cursor-native GetMcpTools / GetDynamicTools is executed by the agent after `mcp_state`, not by an OpenCode catalog tool. Oversized catalogs spill through `write_args` into `agent-tools/<uuid>.txt` and the model reads `filePath` from `WriteSuccess.path`. Echo `WriteArgs.path` on that success field; host write prose has no `<path>` tag, so parsing it invents nothing and leaves the spill path empty.
 - An HTTP success status or clean iterator EOF is not an application-level turn boundary for a bidirectional agent protocol. Require the protocol's terminal event, capture connection trailers/GOAWAY, and rebase from host-owned history when a held-open Run disappears.
 - A native Task display frame does not execute the subagent. Cursor's correlated exec field #28 must be decoded as `SubagentArgs`, emitted once through OpenCode's `task` tool, and answered with the paired typed `SubagentResult` so the held-open Run can resume.
 - Native tool bridges must normalize framework-specific built-in identifiers at the semantic boundary. Cursor's `generalPurpose` maps to OpenCode `general`, while native read-oriented `bugbot` reviews map to `explore`; forwarding those wire names verbatim executes the bridge but fails host validation before spawning anything.
@@ -340,6 +347,23 @@
   path can disagree with host truth — see
   `tasks/plans/optional-seed-todo-snapshot-from-cursor-read.md` (implement only
   if that failure is diagnosed live).
+
+## 2026-09-21 — Epoch catalog hold and recovered seed
+
+- **Same-size catalogs must not replace frozen descriptors.** Refreshing
+  schemas or descriptions when the name set is unchanged retokenizes the tools
+  prefix. Grow by appending new names only; shrink and equal sets keep the
+  epoch advertisement.
+- **Do not re-sort the epoch catalog on grow.** UTF-16 order is for the first
+  advertisement and for sorting newcomers among themselves. Re-sorting the
+  merged list inserts a name that sorts before `z` and retokenizes the tools
+  prefix. The encoder must emit advertised order, not sort again.
+- **Overlay lists follow the same hold.** Skills, subagents, and plugins are
+  rediscovered every Run but equal ids keep frozen bytes (including skill
+  content); new ids append. Shrink does not drop an advertised overlay entry.
+- **A recovered epoch has no original baseline bytes.** Do not freeze live
+  host text as `seedSystemPrompt` after checkpoint-less recovery — Cursor
+  already holds the prefix. Chronological updates stay on the user-turn tail.
 
 ## 2026-08-25 — Pricing gate before every release
 

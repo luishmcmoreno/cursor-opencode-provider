@@ -269,6 +269,16 @@ describe("cursorModeSystemReminder", () => {
     expect(second).toContain("Ask mode is still active")
   })
 
+  it("points a staged plan at the host follow-up instead of plan_exit", () => {
+    const reminder = cursorModeSystemReminder("plan", {
+      planExitAdvertised: true,
+      planStageAdvertised: true,
+    })!
+    expect(reminder).toContain("waits for the host plan review")
+    expect(reminder).toContain("Do not call `plan_exit` to submit or skip")
+    expect(reminder).not.toContain("call OpenCode `plan_exit` so the user can approve")
+  })
+
   it("hands a bridged plan back to Agent mode when plan_enter is restored", () => {
     setActiveCursorMode("sess-plan", "plan", { bridgedPlanEntered: true })
 

@@ -60,7 +60,7 @@ describe("provider / compatibility-layer architecture", () => {
   test("provider executable source and tests contain no fork identities or fork-only vocabulary", () => {
     const found = violations(
       [...SOURCE_FILES, ...TEST_FILES],
-      /MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\boh-my-pi\b|\bOMP\b/,
+      /MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\boh-my-pi\b|\bOMP\b|\bDSH\b|DeepSeek Harness|deepseek-harness|exit_plan_mode|ask_user_question|devin-opencode-provider|\bDevinPlugin\b|\bcreateDevin\b/,
     )
     expect(found).toEqual([])
   })
@@ -110,7 +110,7 @@ describe("provider / compatibility-layer architecture", () => {
     if (DIST_FILES.length === 0) return
     expect(violations(
       DIST_FILES,
-      /@opencode-compat\/|MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\boh-my-pi\b|\bOMP\b/,
+      /@opencode-compat\/|MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\boh-my-pi\b|\bOMP\b|\bDSH\b|DeepSeek Harness|deepseek-harness|exit_plan_mode|ask_user_question|devin-opencode-provider|\bDevinPlugin\b|\bcreateDevin\b/,
     )).toEqual([])
     expect(violations(
       DIST_FILES.filter(file => /(?:plugin(?:-v2|-opencode2)?|web-search-tool|image-save-tool)\.js$/.test(file)),

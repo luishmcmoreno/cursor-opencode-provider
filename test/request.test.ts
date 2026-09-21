@@ -136,9 +136,9 @@ describe("buildRunRequest", () => {
     expect(fsOpts.mcp_descriptors).toHaveLength(1)
     expect(fsOpts.mcp_descriptors[0].server_identifier).toBe("opencode")
     expect(fsOpts.mcp_descriptors[0].tools).toHaveLength(2)
-    expect(fsOpts.mcp_descriptors[0].tools.map((tool: { tool_name: string }) => tool.tool_name).sort()).toEqual([
-      "bash",
+    expect(fsOpts.mcp_descriptors[0].tools.map((tool: { tool_name: string }) => tool.tool_name)).toEqual([
       "read",
+      "bash",
     ])
     // Meta-tool options (#34) also populated.
     expect(rc.mcp_meta_tool_options.mcp_descriptors[0].tools).toHaveLength(2)
@@ -167,22 +167,22 @@ describe("buildRunRequest", () => {
     const rc = decoded.run_request.action.user_message_action.request_context
     const flat = rc.tools
     expect(flat.map((t: any) => t.name)).toEqual([
-      "brave-web_search",
-      "github-create_pull_request",
       "opencode-read",
+      "github-create_pull_request",
+      "brave-web_search",
     ])
     expect(flat.map((t: any) => t.provider_identifier)).toEqual([
-      "brave",
-      "github",
       "opencode",
+      "github",
+      "brave",
     ])
     const descriptors = rc.mcp_file_system_options.mcp_descriptors
     expect(descriptors.map((d: any) => d.server_identifier)).toEqual([
       "opencode",
-      "brave",
       "github",
+      "brave",
     ])
-    expect(descriptors[2].tools[0].tool_name).toBe("create_pull_request")
+    expect(descriptors[1].tools[0].tool_name).toBe("create_pull_request")
     expect(rc.mcp_meta_tool_options.mcp_descriptors).toHaveLength(3)
   })
 

@@ -182,16 +182,18 @@ export function resolveToolServerIdentity(
  * default server (`opencode`). Tools whose prefixes match configured MCP
  * servers keep those server ids (`github`, …). Composite `name` is
  * `<server>-<bareTool>`; local execution still uses the full OpenCode id
- * reconstructed in `mcpRealToolName`.
+ * reconstructed in `mcpRealToolName`. Emit in advertised order — the epoch
+ * catalog owns canonicalization; sorting here would insert on grow.
  */
 export function toolsToDescriptors(
   tools: OpencodeToolDef[],
   providerIdentifier = "opencode",
   knownMcpServers: Iterable<string> = [],
 ): Array<Record<string, unknown>> {
-  return [...tools]
-    .sort((left, right) => left.name.localeCompare(right.name))
-    .map((t) => {
+  // Advertised order is the prefix. The epoch catalog sorts once on first
+  // freeze and appends later names at the tail; re-sorting here would insert
+  // a new tool in front of `z` and invalidate the tools bytes.
+  return tools.map((t) => {
     const id = resolveToolServerIdentity(t.sourceName ?? t.name, providerIdentifier, knownMcpServers)
     const collisionSafeAlias = COLLISION_SAFE_ALIASES.has(t.name)
     return {
@@ -325,11 +327,10 @@ export function toolsToMcpDescriptors(
 
   const byServer = new Map<string, Array<Record<string, unknown>>>()
 
-  // OpenCode's tool catalog is a set even though the hook exposes it as an
-  // array. Keep both the server and per-server tool order canonical so a host
-  // that enumerates the same catalog differently does not invalidate Cursor's
-  // RequestContext prefix cache.
-  for (const t of [...tools].sort((left, right) => left.name.localeCompare(right.name))) {
+  // Walk advertised order: first-seen server, then append tools onto that
+  // server. Same-set host reorder is resolved by `resolveTurnToolState`
+  // before encode so this walk stays epoch-stable.
+  for (const t of tools) {
     const id = resolveToolServerIdentity(t.sourceName ?? t.name, providerIdentifier, knownMcpServers)
     let list = byServer.get(id.server)
     if (!list) {
@@ -343,12 +344,7 @@ export function toolsToMcpDescriptors(
     })
   }
 
-  const orderedServers = [...byServer.keys()].sort((left, right) => {
-    if (left === providerIdentifier) return right === providerIdentifier ? 0 : -1
-    if (right === providerIdentifier) return 1
-    return left.localeCompare(right)
-  })
-  return orderedServers.map((server) => ({
+  return [...byServer.keys()].map((server) => ({
     server_name: server,
     server_identifier: server,
     tools: byServer.get(server)!,
@@ -1050,6 +1046,25 @@ function readRequestResultMetadata(
 }
 
 /**
+ * Cursor's native write executor echoes `WriteArgs.path` on `WriteSuccess.path`.
+ * Large GetMcpTools / GetDynamicTools catalogs spill through `write_args` into
+ * `agent-tools/<uuid>.txt` and then tell the model `filePath` from that success
+ * path. Host write output is free-form prose (often no `<path>` tag), so the
+ * request path is the only host-neutral identity we can report.
+ */
+function writeRequestResultMetadata(
+  raw: Record<string, unknown>,
+  mappedArgs: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const requestedPath =
+    str(raw.path)
+    ?? str(raw.filePath)
+    ?? str(raw.file_path)
+    ?? opencodePathArg(mappedArgs)
+  return requestedPath ? { path: requestedPath } : undefined
+}
+
+/**
  * A partial-read notice is for Cursor's model, never for a file. Refuse only
  * whole-file mutation forms that echo it. A targeted edit or Update File patch
  * cannot truncate an unseen tail, and may legitimately edit source that quotes
@@ -1236,6 +1251,8 @@ export function parseExecServerMessage(
     ? shellStreamResultMetadata(rawArgs)
     : execVariant === "read_args" || execVariant === "pi_read_args"
       ? readRequestResultMetadata(rawArgs, mapped.args)
+      : execVariant === "write_args" || execVariant === "pi_write_args"
+        ? writeRequestResultMetadata(rawArgs, mapped.args)
       : execVariant === "grep_args"
         ? grepRequestResultMetadata(rawArgs)
         : undefined
@@ -2834,8 +2851,9 @@ export function buildTypedExecResult(
       }
     }
     case "write_result": {
-      // `apply_patch` output carries no <path> tag, so prefer the path recorded
-      // when the request was remapped away from `write`.
+      // Prefer the path recorded from WriteArgs / a remapped apply_patch write.
+      // Host write output is not a `<path>` envelope, and Cursor's GetMcpTools
+      // spill copies WriteSuccess.path into the model-visible filePath.
       const remappedPath = str(resultMetadata?.path)
       if (error) return { error: { path: remappedPath ?? "", error } }
       return {

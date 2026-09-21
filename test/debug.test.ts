@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { ensureSecureDebugLog, resolveDebugLogPath } from "../src/debug.js"
+import {
+  DEBUG_LOG_MAX_BYTES,
+  ensureSecureDebugLog,
+  resolveDebugLogPath,
+  truncateDebugLogIfOversized,
+} from "../src/debug.js"
 
 const originalDebugFile = process.env.CURSOR_PROVIDER_DEBUG_FILE
 
@@ -65,6 +70,53 @@ describe("debug log paths / modes (F9)", () => {
       expect(() => ensureSecureDebugLog(path.join(linkedDir, "debug.log"))).toThrow(
         "not a real directory",
       )
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("does not wipe an existing log on ensureSecureDebugLog", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-provider-debug-preserve-"))
+    const file = path.join(root, "debug.log")
+    try {
+      fs.writeFileSync(file, "prior EMITTED tool-call\n", { mode: 0o600 })
+      ensureSecureDebugLog(file, { secureParent: false })
+      expect(fs.readFileSync(file, "utf8")).toBe("prior EMITTED tool-call\n")
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("exports a 10 MiB size cap", () => {
+    expect(DEBUG_LOG_MAX_BYTES).toBe(10 * 1024 * 1024)
+  })
+
+  it("leaves undersized logs alone", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-provider-debug-cap-under-"))
+    const file = path.join(root, "debug.log")
+    try {
+      fs.writeFileSync(file, "keep me\n", { mode: 0o600 })
+      expect(truncateDebugLogIfOversized(file, 1024)).toBe(false)
+      expect(fs.readFileSync(file, "utf8")).toBe("keep me\n")
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("truncates when the log reaches the size cap", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-provider-debug-cap-over-"))
+    const file = path.join(root, "debug.log")
+    try {
+      fs.writeFileSync(file, "x".repeat(64), { mode: 0o600 })
+      expect(truncateDebugLogIfOversized(file, 32)).toBe(true)
+      const body = fs.readFileSync(file, "utf8")
+      expect(body).toContain("--- cursor-provider debug (pid ")
+      expect(body).toContain("debug: size-cap truncate")
+      expect(body).toContain("wasBytes=64")
+      expect(body).toContain("maxBytes=32")
+      expect(body).not.toContain("xxxxx")
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }

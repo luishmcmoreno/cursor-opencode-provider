@@ -257,6 +257,11 @@ describe("createPlanApproved", () => {
       createPlanApprovalQuestion("/plans/99-other.md"),
     )).toBe(false)
   })
+
+  it("rejects non-OpenCode result envelopes instead of recognizing a host format", () => {
+    expect(createPlanApproved(JSON.stringify({ approved: true }), false, question)).toBe(false)
+    expect(createPlanApproved(JSON.stringify({ answers: [] }), false, question)).toBe(false)
+  })
 })
 
 describe("native plan stage payload", () => {
@@ -452,6 +457,8 @@ describe("CreatePlan interaction #7", () => {
     expect(fs.readFileSync(planPath, "utf-8")).toContain("# Gated Plan")
     expect(handled.createPlan?.questionInput?.questions[0]?.question)
       .toBe(createPlanApprovalQuestion(planPath))
+    expect(handled.createPlan?.questionInput?.questions[0]?.question).not.toContain("# Gated Plan")
+    expect(handled.createPlan?.planReview).toContain("# Gated Plan")
   })
 
   it("writes and acknowledges without asking when no plan mode is active", () => {
@@ -709,8 +716,9 @@ describe("CreatePlan execution approval over a held-open Run", () => {
     const callIndex = parts.findIndex((part: any) => part.type === "tool-call")
     expect(textIndex).toBeGreaterThanOrEqual(0)
     expect(textIndex).toBeLessThan(callIndex)
-    const question = JSON.parse(parts[callIndex].input).questions[0].question as string
-    expect(question).not.toContain("Implement it.")
+    const asked = JSON.parse(parts[callIndex].input).questions[0]
+    expect(asked.question).not.toContain("Implement it.")
+    expect(asked.detail).toBeUndefined()
     sessionManager.close(session, "ordinary-cleanup")
   })
 

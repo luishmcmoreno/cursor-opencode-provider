@@ -28,17 +28,17 @@ afterEach(() => {
 
 describe("v1 / OpenCode 2.0 workspace root compatibility", () => {
   it("classic v1: empty session map uses options.workspaceRoot (input.directory)", () => {
-    const project = "/Users/mitra/Projects/my-app"
+    const project = "/workspace/my-app"
     expect(getSessionDirectory("ses_classic")).toBeUndefined()
-    expect(resolveWorkspaceRoot("ses_classic", project, "/Users/mitra")).toBe(
+    expect(resolveWorkspaceRoot("ses_classic", project, "/workspace")).toBe(
       path.resolve(project),
     )
   })
 
   it("classic v1: never consults a foreign session mark", () => {
     markSessionDirectory("ses_opencode2", "/other/project")
-    const project = "/Users/mitra/Projects/my-app"
-    expect(resolveWorkspaceRoot("ses_classic", project, "/Users/mitra")).toBe(
+    const project = "/workspace/my-app"
+    expect(resolveWorkspaceRoot("ses_classic", project, "/workspace")).toBe(
       path.resolve(project),
     )
   })
@@ -46,13 +46,13 @@ describe("v1 / OpenCode 2.0 workspace root compatibility", () => {
   it("OpenCode 2.0: session mark wins over static createSdk cwd fallback", () => {
     markSessionDirectory("ses_2", "/home/user/projects/my-app")
     expect(
-      resolveWorkspaceRoot("ses_2", "/Users/mitra", "/Users/mitra"),
+      resolveWorkspaceRoot("ses_2", "/workspace", "/workspace"),
     ).toBe(path.resolve("/home/user/projects/my-app"))
   })
 
   it("OpenCode 2.0: before context hook, falls back to options then cwd", () => {
-    expect(resolveWorkspaceRoot("ses_new", "/Users/mitra", "/Users/mitra")).toBe(
-      path.resolve("/Users/mitra"),
+    expect(resolveWorkspaceRoot("ses_new", "/workspace", "/workspace")).toBe(
+      path.resolve("/workspace"),
     )
     expect(resolveWorkspaceRoot("ses_new", undefined, "/tmp/daemon")).toBe(
       path.resolve("/tmp/daemon"),

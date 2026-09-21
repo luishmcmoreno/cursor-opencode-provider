@@ -193,6 +193,10 @@ describe("OpenCode answers → Cursor AskQuestionResult (CLI iX parity)", () => 
       'Yes, but only for "new" files',
     ])
   })
+
+  it("does not interpret non-OpenCode result envelopes", () => {
+    expect(parseAnswerSegments([QUESTION], JSON.stringify({ answers: [] }))).toEqual([undefined])
+  })
 })
 
 describe("ask-question query decoding", () => {

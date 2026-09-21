@@ -326,7 +326,22 @@ export function createMessageTypes(): protobuf.Root {
     { id: 3, name: "pattern", type: "string" },
     { id: 4, name: "tool_call_id", type: "string" },
   ])
-  addType(root, "GetMcpToolsToolCall", [{ id: 1, name: "args", type: "GetMcpToolsArgs" }])
+  // agent.v1 GetMcpToolsToolCall is args + result. Cursor's agent fills result
+  // locally (GetDynamicTools / GetMcpTools); large catalogs spill through
+  // write_args and put the spill path on GetMcpToolsSuccess.output_file_path.
+  addType(root, "GetMcpToolsSuccess", [
+    { id: 1, name: "content", type: "string" },
+    { id: 2, name: "output_file_path", type: "string" },
+  ])
+  addType(root, "GetMcpToolsError", [{ id: 1, name: "error", type: "string" }])
+  addType(root, "GetMcpToolsAgentResult", [
+    { id: 1, name: "success", type: "GetMcpToolsSuccess" },
+    { id: 2, name: "error", type: "GetMcpToolsError" },
+  ], [{ name: "result", fields: ["success", "error"] }])
+  addType(root, "GetMcpToolsToolCall", [
+    { id: 1, name: "args", type: "GetMcpToolsArgs" },
+    { id: 2, name: "result", type: "GetMcpToolsAgentResult" },
+  ])
 
   addType(root, "GenerateImageToolArgs", [
     { id: 1, name: "description", type: "string" },

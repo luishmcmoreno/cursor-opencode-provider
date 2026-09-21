@@ -42,9 +42,13 @@ opencode
 
 For a desktop/service launch, export the variables in that process's environment
 before startup. The provider announces the active path as
-`[cursor-provider] CURSOR_PROVIDER_DEBUG logging to …`. The file is truncated
-when that provider process first initializes, so save a copy before restarting
-if two processes must be compared.
+`[cursor-provider] CURSOR_PROVIDER_DEBUG logging to …`. A fresh empty file gets
+a process header on first init. Re-init in the same override path (module
+reload, second isolate) **appends** another header (`reinit=append`) instead of
+wiping earlier lines. Independently, once the file reaches 10 MiB the next
+`trace` call truncates it and writes `debug: size-cap truncate` so growth stays
+bounded. Truncate the override path yourself before a clean run; save a copy
+before comparing two host processes.
 
 Record these facts with every reproduction:
 
@@ -107,9 +111,9 @@ Also inspect the outbound flags:
   checkpoint.
 - `compaction=true` and the subsequent `post-compaction-rebase` intentionally
   rotate Cursor conversation ids.
-- `agent-change` and `system-prompt-change` intentionally rotate once so an
-  opaque checkpoint cannot suppress the newly selected OpenCode agent or
-  vendor prompt. Title/generation lifecycle prompts do not trigger these.
+- `agent-change` and `system-prompt-change` remints are **removed**. Agent /
+  system-prompt identity is diagnostics only; sticky conversations stay held
+  (CLI keeps the same agentId across mode flips).
 
 At provider startup, `conversation persistence: restored` confirms that the
 session binding, checkpoint, reachable blobs, and frozen context were hydrated.
@@ -165,7 +169,9 @@ Important fields:
 `finish:` is a compact duplicate of the final AI SDK and raw counters. Tool-call
 boundaries should show `source=occupancy-checkpoint-*` when a snapshot exists
 (or `intermediate-zero` with no snapshot); the final `TurnEnded` should settle
-the billed occupancy exactly once.
+the billed occupancy exactly once. On occupancy finishes, `rawCacheRead` /
+`occupancyPrefixCache` are the prior-turn checkpoint prefix estimate — not
+Cursor's TurnEnded `cache_read` (that only appears on `reason=stop`).
 
 ### 4. Interpret the cache diagnosis
 
@@ -188,6 +194,7 @@ value, not evidence that the provider dropped writes.
 | `rawReadVsPriorContext` | Aggregate cache-read tokens divided by prior context. This asks how much read credit Cursor reported relative to the reusable starting context. It is not a bounded percentage and can exceed 100% when several internal calls reuse the prefix. |
 | `sameSizedCategoryTokens` | Sum of current categories whose token count exactly matches the prior checkpoint. This compares sizes only, not content identity. |
 | `categoryDelta` | Per-category token-count change (`current - prior`); `new`/`removed` indicate category appearance/disappearance. |
+| `toolsCategoryChurn` | `none`, `upstream-stable-overlay` (tools tokens moved while RequestContext overlay bytes were reused), or `client-overlay-changed` (tools moved and RequestContext was rebuilt). See `createPlanInTurn` / `switchModeInTurn` for the common in-turn trigger. |
 | `checkpointUpdates` | All non-empty checkpoints seen during this held Run. |
 | `tokenDetailUpdates` | Those checkpoints that included decodable token details. Zero explains a stale `checkpoint-previous-turn` source. |
 | `pumpPasses` | Number of OpenCode stream pulls over the held Run. More than one is normal when tools were executed. |
@@ -224,6 +231,36 @@ line aggregates the entire agent Run.
 This is the strongest evidence that the provider kept its observable prefix
 stable but Cursor's backend reported little reuse. The log cannot identify the
 backend cache key or the internal call that missed.
+
+Also check for `superseded-by-new-run` with `pending>0` immediately before the
+bad warm Run. Mid-exec supersede (host fresh turn while a real tool was still
+outstanding) historically cratered cache even with a reused conversation_id.
+`preparePriorSessionForFreshTurn` should cancel those execs and drain
+`turn_ended` first; look for `fresh turn: cancelled N pending exec(s)` and
+`drain outcome=turn-ended` rather than a bare supersede warning.
+
+### One-time upstream tools expansion (CreatePlan and friends)
+
+- `toolsCategoryChurn=upstream-stable-overlay` with `requestContext=reused` and
+  an unchanged RequestContext hash, plus `createPlanInTurn=true` (or
+  `switchModeInTurn=true`) on the same diagnosis line;
+- checkpoint `tools` steps up by ~630–640 tokens once (e.g. 7774→8407) and then
+  stays flat on following turns;
+- the next ordinary turn recovers to a high `rawReadRatio` with `tools+0`.
+
+This is Cursor's backend filing first-use native call/result content (CreatePlan
+call envelope plus its fixed result boilerplate) under the `tools` category. It
+is one-time per conversation — a second plan in the same conversation adds +0 —
+and it also fires on some non-CreatePlan server-side prompt rebuilds, so the
+CreatePlan tag confirms the common case but its absence does not rule this out.
+Our overlay bytes stay identical throughout; there is no client prefix rebuild
+to fix. Do not remint to escape it (strictly worse than one cold turn).
+
+Cost policy: the crater costs ~94% of current context at full price, once per
+planning conversation. Prefer recording the first plan early (small context)
+and refining afterward — follow-up plans are free — over deferring planning
+until investigation is complete. At very large contexts, compact first and plan
+on the fresh small prefix.
 
 ### Client-side context changed
 

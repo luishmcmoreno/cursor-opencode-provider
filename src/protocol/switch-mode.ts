@@ -30,10 +30,8 @@
  * - leaving plan mode is the gate the user must actually see, so it falls back
  *   to the host `question` tool and only rejects when that is absent too.
  *
- * Resolution is keyed solely on the advertised catalog under canonical tool
- * names — never on host identity or model id. A compatibility layer may restate
- * alternate host vocabulary under canonical names before the provider sees the
- * catalog, so the bridge itself remains OpenCode-shaped.
+ * Resolution is keyed solely on the advertised catalog under canonical
+ * OpenCode tool names — never on any external identity or model id.
  *
  * CLI reject reason for user declines: "Mode switch rejected by user"
  * (chunk-7076/dist/ui.js onSwitchModeReject).
@@ -390,16 +388,18 @@ function wrapReminder(body: string): string {
  */
 export function cursorModeSystemReminder(
   targetModeId: string,
-  options: { firstTurn?: boolean; planExitAdvertised?: boolean } = {},
+  options: { firstTurn?: boolean; planExitAdvertised?: boolean; planStageAdvertised?: boolean } = {},
 ): string | undefined {
   const id = normalizeSwitchModeId(targetModeId)
   if (!id) return undefined
   const first = options.firstTurn !== false
-  // Without a host plan_exit, recording the plan is itself the gate: the
-  // provider persists it and then asks the user whether to start implementing.
-  // Naming an unavailable tool would strand the model.
-  const leavePlan =
-    options.planExitAdvertised === false
+  // A host plan-stage tool writes the artifact and its result names the
+  // follow-up that requests approval. plan_exit only leaves plan mode.
+  // Without either tool, recording the plan is the gate and the provider asks
+  // whether to start implementing. Naming an unavailable tool would strand the model.
+  const leavePlan = options.planStageAdvertised
+    ? "record the finished plan with Cursor CreatePlan. The host stage tool waits for the host plan review and does not return until the user accepts or declines. Do not call `plan_exit` to submit or skip that review, and do not implement until the tool returns success"
+    : options.planExitAdvertised === false
       ? "record the finished plan (Cursor CreatePlan). Writing it needs no approval, and the user is then asked whether to start implementing; if they decline, refine the plan and record it again"
       : "record the finished plan, then call OpenCode `plan_exit` so the user can approve leaving plan mode"
 
@@ -547,7 +547,12 @@ export function takeActiveCursorModeReminder(
 
   const reminder = cursorModeSystemReminder(state.modeId, {
     firstTurn: state.firstTurn,
-    ...(advertised ? { planExitAdvertised: advertised.has("plan_exit") } : {}),
+    ...(advertised
+      ? {
+          planExitAdvertised: advertised.has("plan_exit"),
+          planStageAdvertised: advertised.has("cursor_plan_stage"),
+        }
+      : {}),
   })
   if (state.firstTurn) state.firstTurn = false
   return reminder

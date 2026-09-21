@@ -244,10 +244,9 @@ describe("SessionManager", () => {
     expect(destroyed).toBe(true)
   })
 
-  it("supersedes a stale open session when a new Run registers for the same OpenCode session", () => {
-    // A caller that abandons a Run and retries with a fresh one (instead of
-    // delivering a continuation to the held-open Run) must not leak the old
-    // Run's stream indefinitely.
+  it("refuses to supersede a prior Run that still has real pending execs", () => {
+    // Mid-exec supersede throws away the conversation prefix. Fresh-turn
+    // prepare must cancel+drain first; registerSession is not a last-resort kill.
     const mgr = new SessionManager()
     const a = fakeSession()
     a.openCodeSessionId = "opencode-session-1"
@@ -259,13 +258,59 @@ describe("SessionManager", () => {
     b.openCodeSessionId = "opencode-session-1"
     mgr.registerSession(b)
 
+    expect(a.closed).toBe(false)
+    expect(destroyed).toBe(false)
+    expect(mgr.findByExecIds(a.sessionId, [0])).toBe(a)
+    expect(b.closed).toBe(false)
+  })
+
+  it("supersedes a stale open session with no remaining pending execs", () => {
+    const mgr = new SessionManager()
+    const a = fakeSession()
+    a.openCodeSessionId = "opencode-session-1"
+    let destroyed = false
+    a.stream.destroy = () => { destroyed = true }
+    mgr.registerSession(a)
+
+    const b = fakeSession()
+    b.openCodeSessionId = "opencode-session-1"
+    mgr.registerSession(b)
+
     expect(a.closed).toBe(true)
     expect(destroyed).toBe(true)
-    expect(mgr.classify(a.sessionId, 0)).toMatchObject({
-      kind: "terminal",
-      reason: "superseded-by-new-run",
+    expect(b.closed).toBe(false)
+  })
+
+  it("settles bridged-only pendings before superseding a stale session", () => {
+    const mgr = new SessionManager()
+    const a = fakeSession()
+    a.openCodeSessionId = "opencode-session-1"
+    mgr.registerPending(900_000, a, "bridged", "todowrite", true)
+    mgr.registerPending(900_001, a, "bridged", "todowrite", true)
+
+    const b = fakeSession()
+    b.openCodeSessionId = "opencode-session-1"
+    mgr.registerSession(b)
+
+    expect(a.closed).toBe(true)
+    expect(a.pending.size).toBe(0)
+    expect(mgr.classify(a.sessionId, 900_000)).toMatchObject({
+      kind: "duplicate",
+      reason: "delivered",
     })
     expect(b.closed).toBe(false)
+  })
+
+  it("settleBridgedPending leaves real exec pendings alone", () => {
+    const mgr = new SessionManager()
+    const a = fakeSession()
+    a.openCodeSessionId = "opencode-session-1"
+    mgr.registerPending(0, a, "grep_result")
+    mgr.registerPending(900_000, a, "bridged", "todowrite", true)
+    expect(mgr.settleBridgedPending(a)).toBe(1)
+    expect(a.pending.size).toBe(1)
+    expect(mgr.pendingFor(a.sessionId, 0)?.resultField).toBe("grep_result")
+    expect(mgr.findOpenByOpenCodeSessionId("opencode-session-1")).toBe(a)
   })
 
   it("does not interrupt a still-pumping prior session on supersede", () => {
@@ -326,7 +371,54 @@ describe("SessionManager", () => {
     expect(b.closed).toBe(false)
   })
 
-  it("force-closes the oldest session once the open-session cap is exceeded", () => {
+  it("force-closes the oldest idle session once the open-session cap is exceeded", () => {
+    let now = 0
+    const mgr = new SessionManager({ now: () => now, maxOpenSessions: 2 })
+    const a = fakeSession()
+    a.openCodeSessionId = "s1"
+    now = 10
+    mgr.registerSession(a)
+
+    const b = fakeSession()
+    b.openCodeSessionId = "s2"
+    now = 20
+    mgr.registerSession(b)
+
+    const c = fakeSession()
+    c.openCodeSessionId = "s3"
+    now = 30
+    mgr.registerSession(c)
+
+    expect(a.closed).toBe(true)
+    expect(b.closed).toBe(false)
+    expect(c.closed).toBe(false)
+  })
+
+  it("skips pumping and held-pending sessions when choosing which one the cap evicts", () => {
+    let now = 0
+    const mgr = new SessionManager({ now: () => now, maxOpenSessions: 2 })
+    const a = fakeSession()
+    a.openCodeSessionId = "s1"
+    now = 10
+    mgr.registerPending(0, a, "read_result")
+    a.pumpActive = true // oldest, but actively pumping — must not be evicted
+
+    const b = fakeSession()
+    b.openCodeSessionId = "s2"
+    now = 20
+    mgr.registerSession(b) // idle, no pending — eligible for cap eviction
+
+    const c = fakeSession()
+    c.openCodeSessionId = "s3"
+    now = 30
+    mgr.registerSession(c)
+
+    expect(a.closed).toBe(false)
+    expect(b.closed).toBe(true)
+    expect(c.closed).toBe(false)
+  })
+
+  it("does not cap-evict a held-pending session", () => {
     let now = 0
     const mgr = new SessionManager({ now: () => now, maxOpenSessions: 2 })
     const a = fakeSession()
@@ -344,40 +436,9 @@ describe("SessionManager", () => {
     now = 30
     mgr.registerSession(c)
 
-    expect(a.closed).toBe(true)
-    expect(mgr.classify(a.sessionId, 0)).toMatchObject({
-      kind: "terminal",
-      reason: "open-session-cap-exceeded",
-    })
-    expect(b.closed).toBe(false)
-    expect(c.closed).toBe(false)
-  })
-
-  it("skips a still-pumping session when choosing which one the cap evicts", () => {
-    let now = 0
-    const mgr = new SessionManager({ now: () => now, maxOpenSessions: 2 })
-    const a = fakeSession()
-    a.openCodeSessionId = "s1"
-    now = 10
-    mgr.registerPending(0, a, "read_result")
-    a.pumpActive = true // oldest, but actively pumping — must not be evicted
-
-    const b = fakeSession()
-    b.openCodeSessionId = "s2"
-    now = 20
-    mgr.registerPending(0, b, "read_result")
-
-    const c = fakeSession()
-    c.openCodeSessionId = "s3"
-    now = 30
-    mgr.registerSession(c)
-
+    // a is held-pending (protected); b is idle → b is closed to enforce the cap.
     expect(a.closed).toBe(false)
     expect(b.closed).toBe(true)
-    expect(mgr.classify(b.sessionId, 0)).toMatchObject({
-      kind: "terminal",
-      reason: "open-session-cap-exceeded",
-    })
     expect(c.closed).toBe(false)
   })
 
