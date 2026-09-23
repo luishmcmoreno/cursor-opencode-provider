@@ -1100,7 +1100,10 @@ describe("display-only ToolCall pump bridge", () => {
       inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
       outputTokens: { total: 0, text: 0, reasoning: 0 },
     })
-    expect(finish.providerMetadata).toBeUndefined()
+    expect(finish.providerMetadata).toEqual({
+      copilot: { totalNanoAiu: 0 },
+      cursor: { usageVersion: 3, occupancyOnly: true },
+    })
     expect(sessionManager.pendingFor(session.sessionId, 34)?.resultField).toBe("subagent_result")
     sessionManager.resolve(session.sessionId, 34)
   })

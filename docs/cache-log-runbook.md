@@ -146,7 +146,11 @@ Every completed Run emits `turn usage validation:`. Begin with `status`:
 - `status=ok` means the AI SDK input/output partitions sum correctly, the total
   sent to OpenCode matches Cursor's checkpoint total when available, and the
   category breakdown is internally consistent.
-- `status=mismatch` is a provider accounting bug. Preserve the complete line and
+- `status=mismatch` is a provider accounting bug **for the usage that was
+  sent**. Occupancy finishes (tool-call and TurnEnded/stop) validate against
+  occupancy-shaped counters (`output=1`, `cacheRead=prior`); aggregate
+  TurnEnded request ratios live on `finish:` / `cache diagnosis:` and are not
+  required to equal the occupancy prefix ratio. Preserve the complete line and
   the preceding checkpoint/TurnEnded lines before changing cache behavior.
 
 Important fields:
@@ -162,8 +166,8 @@ Important fields:
 | `cursor=used/max(percent)` | Cursor's authoritative context occupancy. |
 | `rawTotal` | Aggregate `TurnEnded` input + output. This is request work, not necessarily current context occupancy. |
 | `sentTotal` | AI SDK input + output sent to OpenCode. With token details, this must equal Cursor `usedTokens`. |
-| `rawCachedRatio` | `(raw cache read + raw cache write) / raw input`. |
-| `sentCachedRatio` | The same ratio after proportional normalization to Cursor's context total. It should match the raw ratio within rounding. |
+| `rawCachedRatio` | For occupancy validation counters: `(prior usedTokens) / usedTokens`. TurnEnded request cache ratios are on `finish:` / cache diagnosis, not this field. |
+| `sentCachedRatio` | Occupancy `cacheRead` / sent input. Should match `rawCachedRatio` when validation uses occupancy-shaped counters. |
 | `breakdownMatch` | Whether Cursor's category totals agree with `usedTokens`. |
 
 `finish:` is a compact duplicate of the final AI SDK and raw counters. Tool-call

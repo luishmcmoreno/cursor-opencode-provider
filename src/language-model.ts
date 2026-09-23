@@ -195,6 +195,7 @@ import {
   formatCursorTokenCategories,
   formatTurnUsageValidation,
   occupancyUsageFromTokenDetails,
+  occupancyValidationCounters,
   OPENCODE_DISPLAY_ONLY_COST_METADATA,
   turnEndedCounter,
 } from "./usage.js"
@@ -2748,16 +2749,16 @@ export async function pump(
           ...OPENCODE_DISPLAY_ONLY_COST_METADATA,
           ...cursorTurnEndedProviderMetadata(te, tokenDetails, contextSource),
         }
-      : occupancyDetails && contextSource
-        ? {
-            ...OPENCODE_DISPLAY_ONLY_COST_METADATA,
-            cursor: {
-              usageVersion: 3,
-              occupancyOnly: true,
-              context: cursorContextUsageMetadata(occupancyDetails, contextSource),
-            },
-          }
-        : undefined
+      : {
+          ...OPENCODE_DISPLAY_ONLY_COST_METADATA,
+          cursor: {
+            usageVersion: 3,
+            occupancyOnly: true,
+            ...(occupancyDetails && contextSource
+              ? { context: cursorContextUsageMetadata(occupancyDetails, contextSource) }
+              : {}),
+          },
+        }
     const reasonLabel = typeof reason === "object" && reason && "unified" in reason
       ? String((reason as { unified?: string }).unified ?? "unknown")
       : String(reason)
@@ -2798,26 +2799,29 @@ export async function pump(
           ? settledSource ?? (contextSource ?? "unavailable")
           : occupancySource}`,
     )
-    if (counters) {
+    // Validate the usage we actually send. Occupancy finishes (tool-call and
+    // TurnEnded/stop) use prior-prefix cacheRead — never compare that against
+    // aggregate TurnEnded request cache ratios (false mismatch). Raw request
+    // counters stay on `finish:` and cache diagnosis only.
+    if (occupancyDetails) {
+      trace(formatTurnUsageValidation(
+        occupancyValidationCounters(
+          occupancyDetails,
+          session.cacheDiagnostics?.priorTokenDetails,
+        ),
+        usage,
+        occupancyDetails,
+        contextSource,
+      ))
+    } else if (counters) {
       trace(formatTurnUsageValidation(counters, usage, tokenDetails, contextSource))
+    }
+    if (counters) {
       trace(formatCursorCacheDiagnostics(
         counters,
         tokenDetails,
         cacheDiagnostics.priorTokenDetails,
         cacheDiagnostics,
-      ))
-    } else if (occupancyDetails) {
-      trace(formatTurnUsageValidation(
-        {
-          inputTokens: occupancyDetails.usedTokens,
-          outputTokens: 1,
-          cacheRead: session.cacheDiagnostics?.priorTokenDetails?.usedTokens ?? 0,
-          cacheWrite: 0,
-          reasoningTokens: 0,
-        },
-        usage,
-        occupancyDetails,
-        contextSource,
       ))
     }
     safeEnqueue({

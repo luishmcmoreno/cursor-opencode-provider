@@ -7,6 +7,7 @@ import {
   formatTurnUsageValidation,
   flatUsageFromV3,
   occupancyUsageFromTokenDetails,
+  occupancyValidationCounters,
   OPENCODE_DISPLAY_ONLY_COST_METADATA,
   turnEndedCounter,
 } from "../src/usage.js"
@@ -198,10 +199,9 @@ describe("occupancyUsageFromTokenDetails", () => {
   })
 
   it("places occupancy on a snapshot whose TUI sum equals usedTokens and output > 0", () => {
-    const usage = occupancyUsageFromTokenDetails(
-      { usedTokens: 153_744, maxTokens: 256_000 },
-      { usedTokens: 123_651, maxTokens: 256_000 },
-    )
+    const details = { usedTokens: 153_744, maxTokens: 256_000 }
+    const prior = { usedTokens: 123_651, maxTokens: 256_000 }
+    const usage = occupancyUsageFromTokenDetails(details, prior)
     expect(usage.outputTokens?.total).toBe(1)
     expect(usage.outputTokens?.text).toBe(1)
     expect(usage.outputTokens?.reasoning).toBe(0)
@@ -210,15 +210,9 @@ describe("occupancyUsageFromTokenDetails", () => {
     expect(usage.inputTokens?.cacheWrite).toBe(0)
     expect(usage.inputTokens?.noCache).toBe(153_744 - 1 - 123_651)
     const validation = formatTurnUsageValidation(
-      {
-        inputTokens: 153_744,
-        outputTokens: 1,
-        cacheRead: 123_651,
-        cacheWrite: 0,
-        reasoningTokens: 0,
-      },
+      occupancyValidationCounters(details, prior),
       usage,
-      { usedTokens: 153_744, maxTokens: 256_000 },
+      details,
       "checkpoint-current-run",
     )
     expect(validation).toContain("status=ok")
@@ -237,6 +231,65 @@ describe("occupancyUsageFromTokenDetails", () => {
     expect(occupancyUsageFromTokenDetails({ usedTokens: 0, maxTokens: 256_000 })).toEqual({
       inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
       outputTokens: { total: 0, text: 0, reasoning: 0 },
+    })
+  })
+
+  it("validates TurnEnded/stop occupancy against prefix counters, not request aggregates", () => {
+    // Live self-verify shape: aggregate TurnEnded cache ratio ≠ prior-prefix
+    // occupancy ratio. Comparing those falsely flipped status=mismatch.
+    const details = {
+      usedTokens: 89_575,
+      maxTokens: 256_000,
+      breakdown: {
+        totalUsedTokens: 89_575,
+        maxTokens: 256_000,
+        categories: [
+          { id: "system_prompt", label: "System Prompt", estimatedTokens: 484 },
+          { id: "tools", label: "Tools", estimatedTokens: 7_732 },
+          { id: "rules", label: "Rules", estimatedTokens: 2_713 },
+          { id: "skills", label: "Skills", estimatedTokens: 2_512 },
+          { id: "mcp", label: "MCP", estimatedTokens: 636 },
+          { id: "subagents", label: "Subagents", estimatedTokens: 903 },
+          { id: "summarized_conversation", label: "Summarized", estimatedTokens: 0 },
+          { id: "conversation", label: "Conversation", estimatedTokens: 74_595 },
+        ],
+      },
+    }
+    const prior = { usedTokens: 87_353, maxTokens: 256_000 }
+    const usage = occupancyUsageFromTokenDetails(details, prior)
+    const turnEndedCounters = {
+      inputTokens: 176_981,
+      outputTokens: 322,
+      cacheRead: 173_440,
+      cacheWrite: 0,
+      reasoningTokens: 0,
+    }
+
+    expect(formatTurnUsageValidation(
+      turnEndedCounters,
+      usage,
+      details,
+      "checkpoint-current-run",
+    )).toContain("status=mismatch")
+
+    const validation = formatTurnUsageValidation(
+      occupancyValidationCounters(details, prior),
+      usage,
+      details,
+      "checkpoint-current-run",
+    )
+    expect(validation).toContain("status=ok")
+    expect(validation).toContain("sentTotal=89575")
+    expect(validation).toContain("totalMatch=true")
+    expect(validation).toContain("breakdownMatch=true")
+    expect(validation).toContain("cacheRatioMatch=true")
+    expect(validation).toContain("rawTotal=89576")
+    expect(occupancyValidationCounters(details, prior)).toEqual({
+      inputTokens: 89_575,
+      outputTokens: 1,
+      cacheRead: 87_353,
+      cacheWrite: 0,
+      reasoningTokens: 0,
     })
   })
 })

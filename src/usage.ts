@@ -348,6 +348,26 @@ export const OPENCODE_DISPLAY_ONLY_COST_METADATA = {
   copilot: { totalNanoAiu: 0 },
 } as const
 
+/**
+ * Counters that mirror {@link occupancyUsageFromTokenDetails} for
+ * {@link formatTurnUsageValidation}. Always validate occupancy finishes —
+ * including TurnEnded/stop — against these, not against aggregate TurnEnded
+ * request counters. Request cache ratios stay on `finish:` / cache diagnosis.
+ */
+export function occupancyValidationCounters(
+  details: CursorConversationTokenDetails,
+  prior?: CursorConversationTokenDetails,
+): CursorUsageCounters {
+  const used = Math.max(0, Math.trunc(details.usedTokens))
+  return {
+    inputTokens: used,
+    outputTokens: used > 0 ? 1 : 0,
+    cacheRead: Math.max(0, Math.trunc(prior?.usedTokens ?? 0)),
+    cacheWrite: 0,
+    reasoningTokens: 0,
+  }
+}
+
 export function occupancyUsageFromTokenDetails(
   details: CursorConversationTokenDetails,
   prior?: CursorConversationTokenDetails,
@@ -355,13 +375,7 @@ export function occupancyUsageFromTokenDetails(
   const used = Math.max(0, Math.trunc(details.usedTokens))
   if (used <= 0) return emptyLanguageModelV3Usage()
   return buildLanguageModelV3UsageFromCounters(
-    {
-      inputTokens: used,
-      outputTokens: 1,
-      cacheRead: prior?.usedTokens ?? 0,
-      cacheWrite: 0,
-      reasoningTokens: 0,
-    },
+    occupancyValidationCounters(details, prior),
     {
       contextTotalTokens: used,
       priorContextTokens: prior?.usedTokens,
