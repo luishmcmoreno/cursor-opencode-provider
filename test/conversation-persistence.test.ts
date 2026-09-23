@@ -18,6 +18,7 @@ import {
 } from "../src/protocol/conversation-state.js"
 import {
   bindConversationId,
+  MAX_ACTIVE_CONVERSATION_BINDINGS,
   resetConversationBindingsForTests,
   restoreConversationBinding,
 } from "../src/protocol/conversation-bind.js"
@@ -220,6 +221,29 @@ describe("conversation restart persistence", () => {
       requestContext: { rules_info_complete: true },
     })
     expect(await getPersistedConversation(root, "ses_late")).toBeUndefined()
+  })
+
+  it("persists a reminted conversation after its recent binding is soft-evicted", async () => {
+    const root = await cacheRoot()
+    const sessionKey = "ses_evicted_remint"
+    bindConversationId(sessionKey)
+    const conversationId = bindConversationId(sessionKey, { reset: true }).conversationId
+    const checkpoint = Uint8Array.from([7, 8, 9])
+    setCheckpoint(conversationId, checkpoint)
+
+    for (let i = 0; i < MAX_ACTIVE_CONVERSATION_BINDINGS; i++) {
+      bindConversationId(`pressure-${i}`)
+    }
+
+    await persistConversationState(root, {
+      sessionKey,
+      conversationId,
+      requestContext: { rules_info_complete: true },
+    })
+    clearMemory()
+    const restored = await hydrateConversationState(root, sessionKey)
+    expect(restored?.conversationId).toBe(conversationId)
+    expect(getCheckpoint(conversationId)).toEqual(checkpoint)
   })
 
   it("refreshes one session record instead of retaining its prior conversation id", async () => {

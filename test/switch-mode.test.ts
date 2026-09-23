@@ -258,7 +258,9 @@ describe("cursorModeSystemReminder", () => {
     expect(cursorModeSystemReminder("project")!).toContain("Project Agent Mode")
     expect(cursorModeSystemReminder("background")!).toContain("background mode")
     expect(cursorModeSystemReminder("edit")!).toContain("Agent mode is active")
-    expect(cursorModeSystemReminder("agent")!).toContain("Agent mode is active")
+    expect(cursorModeSystemReminder("agent")!).toContain("write")
+    expect(cursorModeSystemReminder("agent")!).toContain("edit")
+    expect(cursorModeSystemReminder("agent", { firstTurn: false })!).toContain("write")
   })
 
   it("arms and consumes the first-turn reminder then still-active text", () => {

@@ -176,9 +176,13 @@ export function modelInfoToConfig(
   // tier is a variant parameter. Long-context choices are therefore emitted as
   // separate OpenCode entries by modelsToConfig.
   const documentedContext = getDocumentedCursorModelContext(mi.id)
+  // Cursor Auto (`default`) has no static maxContext on the model list, but
+  // live checkpoints report 256k for the base tier — the previous 200k
+  // fallback made the host context meter disagree with Cursor.
+  const fallbackContext = mi.id === "default" ? 256_000 : 200_000
   const context = contextTier === "long"
     ? (mi.maxContextForMaxMode ?? documentedContext?.maxContextForMaxMode ?? 1_000_000)
-    : (mi.maxContext ?? documentedContext?.maxContext ?? 200_000)
+    : (mi.maxContext ?? documentedContext?.maxContext ?? fallbackContext)
   // OpenCode's overflow/compaction/UI use limit.context; generation and
   // thinking budgets use limit.output. models.dev 1M peers advertise
   // 64k–128k output — a tiny cap makes long-context sessions feel broken

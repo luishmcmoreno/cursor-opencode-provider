@@ -72,6 +72,13 @@ describe("provider / compatibility-layer architecture", () => {
     expect((paths.match(/Symbol\.for\("opencode\.host\.path-bridge"\)/g) ?? []).length).toBe(1)
   })
 
+  test("the structural host event contract uses only a neutral symbol", () => {
+    const bridge = source(path.join(ROOT, "src/host-event-bridge.ts"))
+    expect(bridge).toContain('Symbol.for("opencode.host.event-bridge")')
+    expect(bridge).not.toContain("opencode.compat.event-bridge")
+    expect((bridge.match(/Symbol\.for\("opencode\.host\.event-bridge"\)/g) ?? []).length).toBe(1)
+  })
+
   test("runtime modules do not statically import @opencode-ai/plugin", () => {
     const targets = [
       "src/plugin.ts",

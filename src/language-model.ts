@@ -189,7 +189,6 @@ import {
 import { analyzeReplayFrame, AttemptReplaySafety } from "./replay-safety.js"
 import { readAllFieldsStrict } from "./protocol/struct.js"
 import {
-  buildLanguageModelV3UsageFromCounters,
   cursorUsageCountersFromTurnEnded,
   emptyLanguageModelV3Usage,
   formatCursorCacheDiagnostics,
@@ -733,7 +732,8 @@ async function doStreamImpl(
   }
 
   if (!session) {
-    if (trailingToolResults.length > 0) {
+    const sessionKey = opencodeSessionKey(callOptions)
+    if (!session && trailingToolResults.length > 0) {
       // True continuation (prompt ends with tool results) but the held-open Run
       // is gone (or its write path just failed). Rebase the complete OpenCode
       // prompt onto a fresh conversation: its seed history includes the
@@ -755,7 +755,7 @@ async function doStreamImpl(
       // is preserved. registerSession will not close a prior Run that still
       // has real pending execs; a failed prepare leaves that Run held.
       try {
-        await preparePriorSessionForFreshTurn(opencodeSessionKey(callOptions))
+        await preparePriorSessionForFreshTurn(sessionKey)
       } catch (error) {
         trace(
           `fresh turn: prepare-prior failed — opening the new Run and leaving ` +
@@ -2717,35 +2717,37 @@ export async function pump(
     // OpenCode TUI/GUI replace each assistant message's tokens (they do not
     // sum occupancy) and the TUI footer requires tokens.output > 0. Cost is
     // added per step-finish. Emit checkpoint occupancy snapshots at tool-call
-    // boundaries with a $0 Copilot cost override, then the billed TurnEnded
-    // snapshot once at stop. Char/4 usageEstimate stays traces-only.
+    // boundaries with a $0 Copilot cost override, then one more occupancy
+    // snapshot at TurnEnded/stop. Held-Run TurnEnded counters are cumulative
+    // across every tool step, but this finish only spans the last generation
+    // slice — putting output_tokens/reasoning there makes host tok/s
+    // (generated/stepElapsed) absurd. Keep exact request counters under
+    // providerMetadata.cursor.*Raw. Char/4 usageEstimate stays traces-only.
     const tokenDetails = session.tokenDetails
     const occupancyDetails =
-      !te && tokenDetails && tokenDetails.usedTokens > 0 ? tokenDetails : undefined
+      tokenDetails && tokenDetails.usedTokens > 0 ? tokenDetails : undefined
     const contextSource: CursorContextUsageSource | undefined = tokenDetails
       ? session.tokenDetailsFresh
         ? "checkpoint-current-run"
         : "checkpoint-previous-turn"
       : undefined
-    const counters = te ? cursorUsageCountersFromTurnEnded(te) : undefined
-    const usage = settledUsage ?? (te
-      ? tokenDetails
-        ? buildLanguageModelV3UsageFromCounters(
-            counters!,
-            {
-              contextTotalTokens: tokenDetails.usedTokens,
-              priorContextTokens: session.cacheDiagnostics?.priorTokenDetails?.usedTokens,
-            },
-          )
-        : emptyLanguageModelV3Usage()
-      : occupancyDetails
+    const usage = settledUsage ?? (
+      occupancyDetails
         ? occupancyUsageFromTokenDetails(
             occupancyDetails,
             session.cacheDiagnostics?.priorTokenDetails,
           )
-        : emptyLanguageModelV3Usage())
+        : emptyLanguageModelV3Usage()
+    )
+    const counters = te ? cursorUsageCountersFromTurnEnded(te) : undefined
+    // TurnEnded stays a real (non-occupancyOnly) finish so hosts that collapse
+    // tool-boundary occupancy still keep one context snapshot for the sidebar.
+    // Copilot $0 avoids billing the occupancy-shaped counters as a new prompt.
     const providerMetadata = te
-      ? cursorTurnEndedProviderMetadata(te, tokenDetails, contextSource)
+      ? {
+          ...OPENCODE_DISPLAY_ONLY_COST_METADATA,
+          ...cursorTurnEndedProviderMetadata(te, tokenDetails, contextSource),
+        }
       : occupancyDetails && contextSource
         ? {
             ...OPENCODE_DISPLAY_ONLY_COST_METADATA,

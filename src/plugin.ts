@@ -36,6 +36,7 @@ import {
   createPlanExecutionKickoffText,
   setPlanExecutionKickoff,
 } from "./plan-execution-kickoff.js"
+import { dispatchHostEventBridge } from "./host-event-bridge.js"
 
 const MODULE_URL = new URL("./index.js", import.meta.url).href
 
@@ -262,6 +263,12 @@ export async function CursorPlugin(input: PluginInput): Promise<Hooks> {
           sessionActivity.recordActivity(event.properties.part.sessionID)
           break
       }
+      await dispatchHostEventBridge({
+        event,
+        client: input.client,
+        directory: input.directory,
+        serverUrl: input.serverUrl,
+      })
     },
 
     async "tool.execute.before"(hookInput, output) {

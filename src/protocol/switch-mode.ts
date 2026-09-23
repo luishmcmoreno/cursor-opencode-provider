@@ -513,9 +513,12 @@ Your mandate is to convert user intent into a correct, high-quality implementati
     first
       ? `Agent mode is active (OpenCode build / agents). You have left plan mode and may implement: edit files, run tools, and execute the agreed approach.
 
+The plan-mode restriction is over. An earlier reminder that forbade edits no longer applies.
+
+- Change file contents with the advertised \`write\` and \`edit\` tools.
 - Prefer making progress with the advertised host tools.
 - If the task is large or ambiguous again, switch back to plan mode (OpenCode \`plan_enter\` / SwitchMode target plan) before a large rewrite.`
-      : `Agent mode is still active. Continue implementing with the advertised host tools. Switch back to plan mode only when a new large/ambiguous design decision appears.`,
+      : `Agent mode is still active. Continue implementing with the advertised host tools, and change file contents with \`write\` and \`edit\`. Switch back to plan mode only when a new large/ambiguous design decision appears.`,
   )
 }
 

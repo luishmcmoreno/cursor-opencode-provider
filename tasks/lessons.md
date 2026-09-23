@@ -1,5 +1,28 @@
 # Lessons
 
+- TurnEnded on a held Run is cumulative across every tool step, but the host
+  finish only spans the last generation slice. Emitting `output_tokens` /
+  `reasoning_tokens` there made Kilo tok/s (`(output+reasoning)/elapsed`) hit
+  six figures (8069 tokens / 62ms). Stop finishes now use the same occupancy
+  snapshot as tool boundaries (`output=1`); exact request counters stay under
+  `providerMetadata.cursor.*Raw`.
+- Cursor Auto (`default`) has no static `maxContext` on the model list. The
+  catalog fallback must match live checkpoints (256k base), not a generic 200k,
+  or the host context meter disagrees with Cursor.
+- Display `create_plan_tool_call` mirrors into `todowrite` after the plan file
+  exists. Mark that synthetic plan row `completed`, not `pending`, or hosts
+  keep a forever-open checklist item.
+
+- An in-session helper that calls the model on the parent session while that
+  Run is still waiting for the helper must not be treated as a fresh user
+  turn. Cancelling the pending helper and reusing the parent conversation
+  remints it (`interrupted-run`) and the model resumes lost. Isolate that
+  call when its catalog is a small subset of the busy parent's catalog.
+- After plan approval, the agent-mode reminder has to say the plan-mode
+  edit ban is over and that file changes go through `write` / `edit`. The
+  older reminder says it supersedes other instructions, and the execution
+  turn otherwise appends with the shell.
+
 - Debug log re-init must append when `CURSOR_PROVIDER_DEBUG_FILE` already has
   content. Truncating on every module load wipes mid-run `EMITTED` lines and
   makes self-verify falsely fail ask/todo/task even though the host transcript

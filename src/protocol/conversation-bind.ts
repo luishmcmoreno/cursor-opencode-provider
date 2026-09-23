@@ -15,9 +15,14 @@ import {
  * cached conversation against OpenCode's newly compacted prompt.
  */
 const activeBySession = new Map<string, string>()
+// A compaction id cannot be reconstructed from its host session key. Keep its
+// tiny binding even when the recent-session index soft-evicts that session.
+const remintedBySession = new Map<string, string>()
 export const MAX_ACTIVE_CONVERSATION_BINDINGS = 256
 
 function rememberConversation(sessionKey: string, conversationId: string): void {
+  if (conversationId === sessionIdToUuid(sessionKey)) remintedBySession.delete(sessionKey)
+  else remintedBySession.set(sessionKey, conversationId)
   // Map insertion order is the LRU order. Refresh existing sessions on use.
   activeBySession.delete(sessionKey)
   activeBySession.set(sessionKey, conversationId)
@@ -25,25 +30,27 @@ function rememberConversation(sessionKey: string, conversationId: string): void 
     const oldest = activeBySession.entries().next().value as [string, string] | undefined
     if (!oldest) break
     activeBySession.delete(oldest[0])
-    clearCheckpoint(oldest[1])
-    clearConversationBlobs(oldest[1])
-    clearFrozenRequestContext(oldest[1])
+    // Evict only the lookup pointer. The checkpoint may still be needed by a
+    // held Run, and a returning session can hydrate its durable binding before
+    // resolving another turn. Compaction/reset owns deletion of opaque state.
   }
 }
 
 export function resetConversationBindingsForTests(): void {
   activeBySession.clear()
+  remintedBySession.clear()
 }
 
 export function hasConversationBinding(sessionKey: string): boolean {
-  return activeBySession.has(sessionKey)
+  return activeBySession.has(sessionKey) || remintedBySession.has(sessionKey)
 }
 
 export function isActiveConversationBinding(
   sessionKey: string,
   conversationId: string,
 ): boolean {
-  return activeBySession.get(sessionKey) === conversationId
+  return (activeBySession.get(sessionKey) ?? remintedBySession.get(sessionKey)
+    ?? sessionIdToUuid(sessionKey)) === conversationId
 }
 
 /** Restore a validated durable binding before resolving the next Run. */
@@ -79,7 +86,7 @@ export function resolveConversationGroupId(
 
 /** Current Cursor conversation_id for an OpenCode session key, creating the default binding if needed. */
 export function peekConversationId(sessionKey: string): string {
-  let id = activeBySession.get(sessionKey)
+  let id = activeBySession.get(sessionKey) ?? remintedBySession.get(sessionKey)
   if (!id) {
     id = sessionIdToUuid(sessionKey)
   }
@@ -104,7 +111,8 @@ export function bindConversationId(
   }
 
   if (opts?.reset) {
-    const previousId = activeBySession.get(sessionKey) ?? sessionIdToUuid(sessionKey)
+    const previousId = activeBySession.get(sessionKey) ?? remintedBySession.get(sessionKey)
+      ?? sessionIdToUuid(sessionKey)
     const conversationId = crypto.randomUUID()
     clearCheckpoint(previousId)
     clearConversationBlobs(previousId)

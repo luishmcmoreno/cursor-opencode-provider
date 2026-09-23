@@ -72,6 +72,25 @@ describe("tool-call-bridge", () => {
     })
   })
 
+  it("does not let an empty proto-default success list erase final args todos", () => {
+    const display = parseDisplayToolCall("tc_todos_final", {
+      update_todos_tool_call: {
+        args: {
+          todos: [
+            { id: "a", content: "ocp-token-a", status: "completed" },
+            { id: "b", content: "ocp-token-b", status: "completed" },
+          ],
+        },
+        result: { success: { todos: [] } },
+      },
+    })
+
+    expect(display?.args.todos).toEqual([
+      { id: "a", content: "ocp-token-a", status: "completed", priority: "medium" },
+      { id: "b", content: "ocp-token-b", status: "completed", priority: "medium" },
+    ])
+  })
+
   it("maps CreatePlanToolCall into todowrite with a plan summary todo", () => {
     const display = parseDisplayToolCall("tc_plan", {
       create_plan_tool_call: {
@@ -86,6 +105,7 @@ describe("tool-call-bridge", () => {
     expect(display?.preferredToolName).toBe("todowrite")
     const todos = display!.args.todos as Array<Record<string, unknown>>
     expect(todos[0]?.id).toBe("plan")
+    expect(todos[0]?.status).toBe("completed")
     expect(String(todos[0]?.content)).toContain("Plan: Bridge work")
     expect(todos[1]?.content).toBe("Implement")
 

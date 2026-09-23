@@ -1548,7 +1548,7 @@ describe("display-only ToolCall pump bridge", () => {
     expect(session.closed).toBe(true)
   })
 
-  it("emits V3 usage from turn_ended on finish", async () => {
+  it("emits checkpoint occupancy and preserves raw turn_ended counters", async () => {
     const parts: any[] = []
     const session = fakeSession(
       [
@@ -1579,13 +1579,25 @@ describe("display-only ToolCall pump bridge", () => {
 
     const finish = parts.find((part) => part.type === "finish")
     expect(finish).toBeDefined()
-    expect(finish!.usage.inputTokens.total).toBe(100)
-    expect(finish!.usage.inputTokens.noCache).toBe(85)
-    expect(finish!.usage.inputTokens.cacheRead).toBe(12)
-    expect(finish!.usage.inputTokens.cacheWrite).toBe(3)
-    expect(finish!.usage.outputTokens.total).toBe(40)
-    expect(finish!.usage.outputTokens.text).toBe(31)
-    expect(finish!.usage.outputTokens.reasoning).toBe(9)
+    expect(finish!.usage.inputTokens.total).toBe(139)
+    expect(
+      finish!.usage.inputTokens.noCache
+        + finish!.usage.inputTokens.cacheRead
+        + finish!.usage.inputTokens.cacheWrite,
+    ).toBe(139)
+    expect(finish!.usage.inputTokens.cacheWrite).toBe(0)
+    expect(finish!.usage.outputTokens).toEqual({ total: 1, text: 1, reasoning: 0 })
+    expect(finish!.providerMetadata).toMatchObject({
+      copilot: { totalNanoAiu: 0 },
+      cursor: {
+        inputTokensRaw: 100,
+        outputTokensRaw: 40,
+        cacheReadRaw: 12,
+        cacheWriteRaw: 3,
+        reasoningTokensRaw: 9,
+        context: { usedTokens: 140, maxTokens: 256_000 },
+      },
+    })
   })
 })
 
@@ -1705,4 +1717,3 @@ describe("progress-only continuation pump", () => {
     expect(session.closed).toBe(true)
   })
 })
-

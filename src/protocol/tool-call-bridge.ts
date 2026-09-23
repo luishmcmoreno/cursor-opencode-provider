@@ -347,7 +347,13 @@ export function parseDisplayToolCall(
   if (variant === "update_todos_tool_call" || variant === "create_plan_tool_call") {
     const result = asRecord(payload.result)
     const success = asRecord(result?.success)
-    const completedTodos = Array.isArray(success?.todos) ? success.todos : undefined
+    // Cursor's completed frame may materialize proto-default `todos: []` even
+    // when the real final snapshot is present on args.todos. An empty default
+    // must not erase that named completion snapshot. A non-empty completed
+    // payload remains authoritative (especially for merge calls).
+    const completedTodos = Array.isArray(success?.todos) && success.todos.length > 0
+      ? success.todos
+      : undefined
     const isMerge = variant === "update_todos_tool_call" && args.merge === true
     // OpenCode todowrite replaces the whole list. Prefer the completed payload;
     // otherwise a non-merge args list; otherwise merge against the Run snapshot.
@@ -368,7 +374,10 @@ export function parseDisplayToolCall(
         todos.unshift({
           id: "plan",
           content: [name && `Plan: ${name}`, overview, plan].filter(Boolean).join("\n").slice(0, 2000),
-          status: "pending",
+          // The plan file is already written by the time this display mirror
+          // runs. Leaving it `pending` parks a forever-open row on hosts that
+          // keep todowrite as the user-visible checklist.
+          status: "completed",
           priority: "high",
         })
       }

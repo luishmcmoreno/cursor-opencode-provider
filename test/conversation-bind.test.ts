@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach } from "bun:test"
 import {
   bindConversationId,
+  hasConversationBinding,
+  isActiveConversationBinding,
   MAX_ACTIVE_CONVERSATION_BINDINGS,
   peekConversationId,
   resetConversationBindingsForTests,
@@ -90,7 +92,7 @@ describe("conversation bind / compaction reset", () => {
     clearConversationBlobs("missing")
   })
 
-  it("evicts the least-recently-used binding and its opaque state", () => {
+  it("soft-evicts the least-recently-used binding without dropping warm state", () => {
     const first = bindConversationId("oldest").conversationId
     setCheckpoint(first, Uint8Array.from([1]))
     setConversationBlob(first, Uint8Array.from([2]), Uint8Array.from([3]))
@@ -100,8 +102,26 @@ describe("conversation bind / compaction reset", () => {
       bindConversationId(`new-${i}`)
     }
 
-    expect(getCheckpoint(first)).toBeUndefined()
-    expect(getConversationBlob(first, Uint8Array.from([2]))).toBeUndefined()
-    expect(getFrozenRequestContext(first)).toBeUndefined()
+    expect(getCheckpoint(first)).toEqual(Uint8Array.from([1]))
+    expect(getConversationBlob(first, Uint8Array.from([2]))).toEqual(Uint8Array.from([3]))
+    expect(getFrozenRequestContext(first)).toBeDefined()
+    expect(isActiveConversationBinding("oldest", first)).toBe(true)
+    expect(bindConversationId("oldest").conversationId).toBe(first)
+  })
+
+  it("keeps a reminted id sticky after its recent binding is evicted", () => {
+    bindConversationId("oldest-reminted")
+    const reminted = bindConversationId("oldest-reminted", { reset: true }).conversationId
+    setCheckpoint(reminted, Uint8Array.from([4, 5]))
+
+    for (let i = 0; i < MAX_ACTIVE_CONVERSATION_BINDINGS; i++) {
+      bindConversationId(`pressure-${i}`)
+    }
+
+    expect(hasConversationBinding("oldest-reminted")).toBe(true)
+    expect(isActiveConversationBinding("oldest-reminted", reminted)).toBe(true)
+    expect(getCheckpoint(reminted)).toEqual(Uint8Array.from([4, 5]))
+    expect(bindConversationId("oldest-reminted").conversationId).toBe(reminted)
+    expect(isActiveConversationBinding("oldest-reminted", sessionIdToUuid("oldest-reminted"))).toBe(false)
   })
 })

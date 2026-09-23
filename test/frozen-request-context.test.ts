@@ -508,7 +508,7 @@ describe("frozen request_context", () => {
     expect(changed.context.tools).toHaveLength(2)
   })
 
-  it("binding LRU eviction clears frozen context with other opaque state", () => {
+  it("binding LRU eviction keeps the frozen context warm", () => {
     const first = bindConversationId("oldest-freeze").conversationId
     setFrozenRequestContext(first, { tools: [] })
     expect(getFrozenRequestContext(first)).toBeDefined()
@@ -517,7 +517,7 @@ describe("frozen request_context", () => {
       bindConversationId(`new-freeze-${i}`)
     }
 
-    expect(getFrozenRequestContext(first)).toBeUndefined()
+    expect(getFrozenRequestContext(first)).toBeDefined()
   })
 
   it("clearFrozenRequestContext is a no-op for unknown ids", () => {

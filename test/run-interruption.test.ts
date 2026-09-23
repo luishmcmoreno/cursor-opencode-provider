@@ -588,21 +588,23 @@ describe("interrupted Cursor Run handling", () => {
     )
 
     const finish = parts.find((part) => part.type === "finish")
-    expect(finish.usage.inputTokens).toEqual({
-      total: 100,
-      noCache: 85,
-      cacheRead: 10,
-      cacheWrite: 5,
-    })
+    expect(finish.usage.inputTokens.total + finish.usage.outputTokens.total).toBe(150)
     expect(finish.usage.outputTokens).toEqual({
-      total: 50,
-      text: 43,
-      reasoning: 7,
+      total: 1,
+      text: 1,
+      reasoning: 0,
     })
-    expect(finish.providerMetadata.cursor.context).toMatchObject({
-      source: "checkpoint-previous-turn",
-      stale: true,
-      usedTokens: 150,
+    expect(finish.providerMetadata.cursor).toMatchObject({
+      inputTokensRaw: 100,
+      outputTokensRaw: 50,
+      cacheReadRaw: 10,
+      cacheWriteRaw: 5,
+      reasoningTokensRaw: 7,
+      context: {
+        source: "checkpoint-previous-turn",
+        stale: true,
+        usedTokens: 150,
+      },
     })
   })
 
@@ -648,15 +650,15 @@ describe("interrupted Cursor Run handling", () => {
         + finish.usage.inputTokens.cacheRead
         + finish.usage.inputTokens.cacheWrite,
     ).toBe(finish.usage.inputTokens.total)
-    expect(finish.usage.inputTokens.cacheRead / finish.usage.inputTokens.total).toBeCloseTo(
-      230_400 / 330_222,
-      4,
-    )
+    // Held-Run TurnEnded counters are cumulative; this finish only covers the
+    // last generation slice. Display usage is checkpoint occupancy (output=1)
+    // so host tok/s stays sane. Exact request counters stay under *Raw.
     expect(finish.usage.outputTokens).toEqual({
-      total: 3_206,
-      text: 2_726,
-      reasoning: 480,
+      total: 1,
+      text: 1,
+      reasoning: 0,
     })
+    expect(finish.providerMetadata.copilot).toEqual({ totalNanoAiu: 0 })
     expect(finish.providerMetadata.cursor).toMatchObject({
       inputTokensRaw: 330_222,
       outputTokensRaw: 3_206,
@@ -715,17 +717,13 @@ describe("interrupted Cursor Run handling", () => {
     )
 
     const finish = parts.find((part) => part.type === "finish")
-    expect(finish.usage.inputTokens).toEqual({
-      total: 101_753,
-      noCache: 21_881,
-      cacheRead: 79_872,
-      cacheWrite: 0,
-    })
+    expect(finish.usage.inputTokens.total + finish.usage.outputTokens.total).toBe(103_144)
     expect(finish.usage.outputTokens).toEqual({
-      total: 1_391,
-      text: 866,
-      reasoning: 525,
+      total: 1,
+      text: 1,
+      reasoning: 0,
     })
+    expect(finish.providerMetadata.copilot).toEqual({ totalNanoAiu: 0 })
     expect(finish.providerMetadata.cursor).toMatchObject({
       inputTokensRaw: 101_753,
       outputTokensRaw: 1_391,

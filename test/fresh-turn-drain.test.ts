@@ -112,6 +112,24 @@ describe("fresh-turn prior drain", () => {
     expect(written.length).toBeGreaterThan(0)
   })
 
+  it("keeps a child session separate while draining a new turn on the busy parent", async () => {
+    const parent = fakeSessionWithPayloads([turnEndedPayload(100, 80)])
+    parent.toolCatalog = Array.from({ length: 76 }, (_, index) => ({ name: `tool-${index}` })) as never
+    sessionManager.registerPending(1, parent, "read_result", "read", false)
+
+    // OpenCode child agents carry their own session id. Their reduced catalog
+    // cannot identify a child call when a new user turn can have the same set.
+    expect(await preparePriorSessionForFreshTurn("ses_child", { timeoutMs: 1_000 })).toBe("none")
+    expect(parent.pending.size).toBe(1)
+    expect(parent.closed).toBe(false)
+
+    expect(await preparePriorSessionForFreshTurn(parent.openCodeSessionId, {
+      timeoutMs: 1_000,
+    })).toBe("drained")
+    expect(parent.pending.size).toBe(0)
+    expect(parent.closed).toBe(true)
+  })
+
   it("cancelPendingExecsForFreshTurn writes an error result for each open exec", () => {
     const session = fakeSessionWithPayloads([])
     sessionManager.registerPending(0, session, "grep_result", "grep", false)

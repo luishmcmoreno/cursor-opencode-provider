@@ -312,6 +312,11 @@ describe("modelInfoToConfig (context window selection)", () => {
     expect(cfg.limit.context).toBe(200000)
   })
 
+  it("falls back to 256000 for Cursor Auto when no static maxContext exists", () => {
+    const cfg = modelInfoToConfig({ ...base, id: "default" } as any)
+    expect(cfg.limit.context).toBe(256000)
+  })
+
   it("falls back to generated Cursor docs metadata before 200000", () => {
     const grok = modelInfoToConfig({ ...base, id: "grok-4.5" } as any)
     const grok46 = modelInfoToConfig({ ...base, id: "grok-4.6" } as any)
