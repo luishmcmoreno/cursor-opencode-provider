@@ -91,8 +91,8 @@ describe("buildOpenCodeInteractionGuidance", () => {
       { name: "bash" },
       { name: "read" },
     ], false, "/workspace/project")
-    expect(guidance).toContain("exactly these executable tools for this turn: `bash`, `read`")
-    expect(guidance).toContain("Call only tools in that exact OpenCode list")
+    expect(guidance).toContain("these direct tools for this turn: `bash`, `read`")
+    expect(guidance).toContain("Call only tools in that direct OpenCode list")
     expect(guidance).toContain("not an OpenCode or MCP catalog tool")
     expect(guidance).toContain("do not narrate that they are missing")
     expect(guidance).toContain("without claiming a missing MCP tool")
@@ -142,6 +142,10 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(withShell).toContain("it is not a shell")
     expect(withShell).toContain("call OpenCode `shell`")
     expect(withShell).toContain("Do not pass `command` to `execute`")
+    expect(withShell).toContain("including MCP server tools, call them inside `execute` through `tools`")
+    expect(withShell).toContain("exact paths and signatures in that catalog or returned by its `search` function")
+    expect(withShell).toContain("Call `execute` with `{ code }` to run them")
+    expect(withShell).toContain("do not request a Code Mode tool as a direct OpenCode tool call")
 
     const withBash = buildOpenCodeInteractionGuidance([
       { name: "execute" },
@@ -155,6 +159,12 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(executeOnly).toContain("Do not pass `command` to `execute`")
     expect(executeOnly).not.toContain("call OpenCode `shell`")
     expect(executeOnly).not.toContain("call OpenCode `bash`")
+    expect(executeOnly).toContain("including MCP server tools")
+
+    const withoutExecute = buildOpenCodeInteractionGuidance([
+      { name: "shell" },
+    ], false, "/workspace/project")
+    expect(withoutExecute).not.toContain("Code Mode catalog lists additional tools")
   })
 
   it("prefers edit and write over shell file mutation", () => {

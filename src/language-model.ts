@@ -4004,6 +4004,9 @@ export function buildOpenCodeInteractionGuidance(
         ? `- OpenCode \`execute\` is Code Mode JavaScript (\`code\`); it is not a shell. For OS commands, call OpenCode ${shell}. Do not pass \`command\` to \`execute\`.`
         : "- OpenCode `execute` is Code Mode JavaScript (`code`); it is not a shell. Do not pass `command` to `execute`.",
     )
+    instructions.push(
+      "- When the host's Code Mode catalog lists additional tools, including MCP server tools, call them inside `execute` through `tools`. Use only the exact paths and signatures in that catalog or returned by its `search` function. Call `execute` with `{ code }` to run them; do not request a Code Mode tool as a direct OpenCode tool call.",
+    )
   }
   if (names.has("task") || names.has("subagent")) {
     const target = names.has("task") ? "`task`" : "`subagent`"
@@ -4045,11 +4048,11 @@ export function buildOpenCodeInteractionGuidance(
     )
   }
   return [
-    `OpenCode exposes exactly these executable tools for this turn: ${[...names].map((name) => `\`${name}\``).join(", ")}.`,
+    `OpenCode exposes these direct tools for this turn: ${[...names].map((name) => `\`${name}\``).join(", ")}.`,
     `Workspace root: ${JSON.stringify(workspaceRoot)}. Resolve workspace paths against exactly this root; never invent an absolute prefix, and verify uncertain paths with an available tool before using them.`,
     subagents.executor
-      ? "Call only tools in that exact OpenCode list for ordinary host execution. Cursor-native Task/subagent requests are permitted because a compatible host executor is listed. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing."
-      : "Call only tools in that exact OpenCode list for ordinary host execution. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing. Other unlisted Cursor-native tools are not bridged; complete the work with the listed tools or explain the limitation without claiming a missing MCP tool.",
+      ? "Call only tools in that direct OpenCode list for ordinary host execution. Cursor-native Task/subagent requests are permitted because a compatible host executor is listed. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing."
+      : "Call only tools in that direct OpenCode list for ordinary host execution. Bridged Cursor interactions named below (AskQuestion, SwitchMode, CreatePlan, …) are not OpenCode/MCP catalog tools — raise them normally and do not narrate that they are missing. Other unlisted Cursor-native tools are not bridged; complete the work with the listed tools or explain the limitation without claiming a missing MCP tool.",
     ...(instructions.length > 0
       ? ["Use these OpenCode tools instead of equivalent Cursor-native UI interactions:"]
       : []),

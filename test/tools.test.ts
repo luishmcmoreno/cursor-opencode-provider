@@ -602,6 +602,26 @@ describe("OpenCode 2 host tool dialect", () => {
       toolName: "execute",
       args: { code: "return 1 + 1" },
     })
+
+    // OpenCode 2 keeps MCP tools inside Code Mode. The provider must send the
+    // host's JavaScript through `execute` without treating the nested MCP name
+    // as an absent direct AI SDK tool.
+    const code = 'return await tools.context7["resolve-library-id"]({ libraryName: "react" })'
+    const parsed = parseExecServerMessage({
+      id: 42,
+      mcp_args: {
+        name: "opencode-execute",
+        tool_name: "execute",
+        provider_identifier: "opencode",
+        args: [mcpArgEntry("code", code)],
+      },
+    }, oc2)
+    expect(parsed?.toolName).toBe("execute")
+    expect(parsed?.args).toEqual({ code })
+    expect(buildToolCallPart(parsed!, "session")).toMatchObject({
+      toolName: "execute",
+      input: JSON.stringify({ code }),
+    })
   })
 
   it("parses read_args onto path for OpenCode 2", () => {
