@@ -77,7 +77,7 @@ describe("collectRules / buildRequestContext", () => {
         }],
       })
       const subagents = ctx.custom_subagents as Array<Record<string, unknown>>
-      expect(subagents.map((agent) => agent.name)).toEqual(expect.arrayContaining(["general", "explore", "reviewer"]))
+      expect(subagents.map((agent) => agent.name)).toEqual(["general", "explore", "reviewer"])
       expect(String(subagents.find((agent) => agent.name === "reviewer")?.prompt).trim())
         .toBe("Review carefully.")
       // The raw host task schema is incomplete (subagent_type is a string, not an

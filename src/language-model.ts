@@ -179,7 +179,7 @@ import {
   CURSOR_HOST_AGENT_OPTION,
 } from "./shared.js"
 import { isCompactionSession } from "./compaction-marker.js"
-import { getSessionDirectory } from "./session-directory.js"
+import { resolveSessionWorkspaceRoot } from "./session-directory.js"
 import type { SeedHistoryMessage } from "./protocol/request.js"
 import { assertCursorUserImageSupport, extractCursorPromptImages } from "./image-input.js"
 import { resolveCursorModelSupportsImages } from "./model-metadata.js"
@@ -1050,24 +1050,14 @@ async function startSession(
   const lifecycle = !allowTools && !isCompaction && !recovery
   // v1 sets `options.workspaceRoot` correctly per invocation (`input.directory`,
   // one plugin instance per project). OpenCode 2.0 runs one daemon across many
-  // projects, so its static option is only a fallback for the directory recorded
-  // from `session.hook("context")`.
-  const headerDir = (() => {
-    const h = (callOptions.headers ?? {}) as Record<string, string | undefined>
-    const raw = h["x-opencode-directory"] ?? h["X-Opencode-Directory"] ?? h["x-opencode-dir"]
-    if (typeof raw === "string" && raw.trim().length > 0) {
-      try {
-        return decodeURIComponent(raw.trim())
-      } catch {
-        return raw.trim()
-      }
-    }
-    return undefined
-  })()
-
-  const workspaceRoot = path.resolve(
-    headerDir ?? getSessionDirectory(sessionKey) ?? (options.workspaceRoot || process.cwd()),
-  )
+  // projects, so its static option is only a last-resort fallback. Prefer the
+  // per-request `x-opencode-directory` header, then the session mark recorded
+  // from `session.hook("context")` via `getSessionDirectory`.
+  const workspaceRoot = resolveSessionWorkspaceRoot({
+    sessionKey,
+    headers: callOptions.headers,
+    workspaceRoot: options.workspaceRoot,
+  })
   const baseSystemPrompt = extractSystemPrompt(prompt)
   const interactionGuidance = buildOpenCodeInteractionGuidance(cursorTools, isCompaction, workspaceRoot)
   // Prompt-identity diagnostics are filled after Context Epoch admission below
