@@ -1382,7 +1382,7 @@ async function startSession(
     throw error
   }
 
-  const hostToolDialect = hostToolDialectFromTools(tools)
+  const hostToolDialect = hostToolDialectFromTools(tools, options.defaultDialect)
   trace(
     `host tool dialect: filePathKey=${hostToolDialect.filePathKey} shellTool=${hostToolDialect.shellTool} ` +
       `tools=[${tools.map((t) => t.name).join(",")}]`,
@@ -3106,7 +3106,7 @@ export async function pump(
           const display = parseDisplayToolCall(callId, toolCall, session.mirroredTodos)
           const advertised = advertisedToolNamesFromDescriptors(session.toolDescriptors)
           const bridged = display
-            ? resolveBridgedOpenCodeToolCall(display, advertised)
+            ? resolveBridgedOpenCodeToolCall(display, advertised, session.hostToolDialect)
             : undefined
           if (!display) {
             const callIdLog = callId.replace(/\r?\n/g, "\\n")
@@ -4259,11 +4259,19 @@ function extractTools(callOptions: LanguageModelV3CallOptions): OpencodeToolDef[
   const out: OpencodeToolDef[] = []
   for (const t of tools) {
     // LanguageModelV3FunctionTool always has type:"function". Be defensive in
-    // case a middleware strips it — still accept anything with a name + schema.
-    const any = t as { type?: string; name?: string; description?: string; inputSchema?: unknown }
-    if (any.type === "function" || (any.name && any.inputSchema !== undefined)) {
+    // case a middleware strips it or passes schema as parameters/schema.
+    const any = t as {
+      type?: string
+      name?: string
+      description?: string
+      inputSchema?: unknown
+      parameters?: unknown
+      schema?: unknown
+    }
+    const schema = any.inputSchema ?? any.parameters ?? any.schema
+    if (any.type === "function" || (any.name && schema !== undefined)) {
       if (!any.name) continue
-      out.push({ name: any.name, description: any.description, inputSchema: any.inputSchema })
+      out.push({ name: any.name, description: any.description, inputSchema: schema })
     }
   }
   trace(`extractTools: ${tools.length} incoming → ${out.length} advertised [${out.map((t) => t.name).join(",")}]`)

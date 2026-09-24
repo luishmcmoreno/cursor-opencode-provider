@@ -22,6 +22,7 @@ import {
 import { applyCursorProviderInventory, CURSOR_INTEGRATION_ID } from "./opencode2/catalog.js"
 import { applyCursorIntegration, resolveCursorAccessToken } from "./opencode2/integration.js"
 import { registerTodoTools } from "./opencode2/todo-tools.js"
+import { OPENCODE_2_TOOL_DIALECT } from "./protocol/tools.js"
 import { clearSessionTodos } from "./todo-store.js"
 import { markCompactionSession } from "./compaction-marker.js"
 import { markSessionDirectory } from "./session-directory.js"
@@ -263,6 +264,7 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           // below via `getSessionDirectory`, which `language-model.ts` prefers.
           workspaceRoot,
           cacheDir,
+          defaultDialect: OPENCODE_2_TOOL_DIALECT,
           ...event.options,
         } as CreateCursorOptions)
       }),
