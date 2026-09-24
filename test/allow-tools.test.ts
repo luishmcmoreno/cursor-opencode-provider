@@ -268,6 +268,17 @@ describe("compaction tool catalog", () => {
       .toEqual({ reset: false })
   })
 
+  it("rebases once when the host rewrites history without a model compaction turn", () => {
+    const sessionKey = "ses_local_rewrite"
+    const before = bindConversationId(sessionKey).conversationId
+    const reset = resolveTurnConversationReset({ sessionKey, isCompaction: false, historyRewrite: true })
+    expect(reset).toEqual({ reset: true, reason: "history-rewrite" })
+    const after = bindConversationId(sessionKey, reset).conversationId
+    expect(after).not.toBe(before)
+    expect(resolveTurnConversationReset({ sessionKey, isCompaction: false }))
+      .toEqual({ reset: false })
+  })
+
   it("keeps sticky conversation across host agent or system prompt hash changes", () => {
     const sessionKey = "ses_prompt_identity"
     expect(resolveTurnConversationReset({

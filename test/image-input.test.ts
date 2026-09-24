@@ -128,6 +128,60 @@ describe("Cursor image input", () => {
     })
   })
 
+  it("harvests historical user file images after a later text-only user turn", async () => {
+    const prompt = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "archive" },
+          { type: "file", mediaType: "image/png", data: Uint8Array.from([1, 2, 3]) },
+          { type: "file", mediaType: "image/png", data: Uint8Array.from([4, 5, 6]) },
+        ],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "next turn" }],
+      },
+    ]
+
+    const result = await extractCursorPromptImages(
+      prompt,
+      prompt[1] as Record<string, unknown>,
+      { supportsImages: true },
+    )
+
+    expect(result.userImageCount).toBe(0)
+    expect(result.candidateCount).toBe(2)
+    expect(result.images).toEqual([
+      { data: Uint8Array.from([1, 2, 3]), filename: "image-1", mimeType: "image/png" },
+      { data: Uint8Array.from([4, 5, 6]), filename: "image-2", mimeType: "image/png" },
+    ])
+    expect(result.hashes).toHaveLength(2)
+  })
+
+  it("keeps last-user images owned by user extraction when the same bytes also appear earlier", async () => {
+    const bytes = Uint8Array.from([9, 8, 7])
+    const lastUser = {
+      role: "user",
+      content: [{ type: "file", mediaType: "image/png", data: bytes }],
+    }
+    const prompt = [
+      {
+        role: "user",
+        content: [{ type: "file", mediaType: "image/png", data: bytes }],
+      },
+      lastUser,
+    ]
+
+    const result = await extractCursorPromptImages(prompt, lastUser, { supportsImages: true })
+
+    expect(result.userImageCount).toBe(1)
+    expect(result.images).toEqual([
+      { data: bytes, filename: "image-1", mimeType: "image/png" },
+    ])
+    expect(result.duplicateCount).toBe(1)
+  })
+
   it("ignores non-image history media", async () => {
     const result = await extractCursorHistoryImages([
       {

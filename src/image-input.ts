@@ -270,23 +270,46 @@ export async function extractCursorUserImages(
   return images
 }
 
+function pushImageFileParts(
+  parts: Record<string, unknown>[],
+  content: readonly unknown[],
+): void {
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue
+    const file = part as Record<string, unknown>
+    if (
+      file.type === "file" &&
+      typeof file.mediaType === "string" &&
+      file.mediaType.startsWith("image/")
+    ) parts.push(file)
+  }
+}
+
 function cursorHistoryImageParts(prompt: readonly unknown[]): Record<string, unknown>[] {
   const parts: Record<string, unknown>[] = []
-  for (const message of prompt) {
+  // Last user attachments stay owned by extractCursorUserImages so a prompt that
+  // still carries images on the trailing user message is not double-attached.
+  let lastUserIndex = -1
+  for (let i = 0; i < prompt.length; i++) {
+    const message = prompt[i]
+    if (!message || typeof message !== "object") continue
+    if ((message as Record<string, unknown>).role === "user") lastUserIndex = i
+  }
+
+  for (let i = 0; i < prompt.length; i++) {
+    const message = prompt[i]
     if (!message || typeof message !== "object") continue
     const record = message as Record<string, unknown>
     if (!Array.isArray(record.content)) continue
 
+    if (record.role === "user") {
+      if (i === lastUserIndex) continue
+      pushImageFileParts(parts, record.content)
+      continue
+    }
+
     if (record.role === "assistant") {
-      for (const part of record.content) {
-        if (!part || typeof part !== "object") continue
-        const file = part as Record<string, unknown>
-        if (
-          file.type === "file" &&
-          typeof file.mediaType === "string" &&
-          file.mediaType.startsWith("image/")
-        ) parts.push(file)
-      }
+      pushImageFileParts(parts, record.content)
       continue
     }
 
@@ -372,9 +395,13 @@ export async function extractCursorPromptImages(
   const maxBytes = cursorImageBudget(options.maxBytes ?? MAX_CURSOR_IMAGE_INPUT_BYTES)
   const userImages = await extractCursorUserImages(lastUser, options.signal, maxBytes)
   const userBytes = userImages.reduce((total, image) => total + image.data.length, 0)
+  // Seed history dedupe with this-turn last-user hashes so the same bytes on an
+  // earlier user/assistant/tool message are not attached twice in one Run.
+  const seenHashes = new Set(options.seenHistoryHashes)
+  for (const image of userImages) seenHashes.add(imageContentHash(image.data))
   const history = await extractCursorHistoryImages(prompt, {
     supportsImages: options.supportsImages,
-    seenHashes: options.seenHistoryHashes,
+    seenHashes,
     signal: options.signal,
     maxBytes: maxBytes - userBytes,
     filenameOffset: userImages.length,

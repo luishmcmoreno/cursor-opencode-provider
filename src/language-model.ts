@@ -175,6 +175,7 @@ import { resolveAgentUrl } from "./agent-url.js"
 import {
   CURSOR_API_HOST,
   CURSOR_COMPACTION_OPTION,
+  CURSOR_HISTORY_REWRITE_OPTION,
   CURSOR_HOST_AGENT_OPTION,
 } from "./shared.js"
 import { isCompactionSession } from "./compaction-marker.js"
@@ -1062,6 +1063,7 @@ async function startSession(
   const resetState = resolveTurnConversationReset({
     sessionKey,
     isCompaction,
+    historyRewrite: providerOptions?.[CURSOR_HISTORY_REWRITE_OPTION] === true,
   })
   // Compaction must not reuse the prior conversation; its first normal turn
   // must also rebase so the summary-agent checkpoint cannot replace the normal
@@ -4357,16 +4359,21 @@ export async function resolveTurnToolState(input: {
 export function resolveTurnConversationReset(input: {
   sessionKey?: string
   isCompaction: boolean
+  historyRewrite?: boolean
   /** @deprecated Ignored — prompt identity never remints. Kept for call-site compat. */
   promptIdentity?: PromptIdentity
 }): {
   reset: boolean
-  reason?: "compaction" | "post-compaction-rebase"
+  reason?: "compaction" | "post-compaction-rebase" | "history-rewrite"
 } {
   const { sessionKey, isCompaction } = input
   if (isCompaction) {
     if (sessionKey) rememberPostCompactionRebase(sessionKey)
     return { reset: true, reason: "compaction" }
+  }
+  if (input.historyRewrite) {
+    if (sessionKey) postCompactionRebaseBySession.delete(sessionKey)
+    return { reset: true, reason: "history-rewrite" }
   }
 
   // Diagnostics only: accept promptIdentity for remember without reminting.
