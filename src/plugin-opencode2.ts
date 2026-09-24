@@ -389,7 +389,10 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
     const rememberSessionDirectory = async (sessionID: string) => {
       try {
         const info = await ctx.session.get({ sessionID })
-        markSessionDirectory(sessionID, info.location?.directory)
+        const directory =
+          (info as { directory?: string; location?: { directory?: string } })?.directory ??
+          (info as { directory?: string; location?: { directory?: string } })?.location?.directory
+        markSessionDirectory(sessionID, directory)
       } catch {
         // Best effort — falls back to the static workspaceRoot above.
       }

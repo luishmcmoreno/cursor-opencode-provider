@@ -1052,8 +1052,21 @@ async function startSession(
   // one plugin instance per project). OpenCode 2.0 runs one daemon across many
   // projects, so its static option is only a fallback for the directory recorded
   // from `session.hook("context")`.
+  const headerDir = (() => {
+    const h = (callOptions.headers ?? {}) as Record<string, string | undefined>
+    const raw = h["x-opencode-directory"] ?? h["X-Opencode-Directory"] ?? h["x-opencode-dir"]
+    if (typeof raw === "string" && raw.trim().length > 0) {
+      try {
+        return decodeURIComponent(raw.trim())
+      } catch {
+        return raw.trim()
+      }
+    }
+    return undefined
+  })()
+
   const workspaceRoot = path.resolve(
-    getSessionDirectory(sessionKey) ?? (options.workspaceRoot || process.cwd()),
+    headerDir ?? getSessionDirectory(sessionKey) ?? (options.workspaceRoot || process.cwd()),
   )
   const baseSystemPrompt = extractSystemPrompt(prompt)
   const interactionGuidance = buildOpenCodeInteractionGuidance(cursorTools, isCompaction, workspaceRoot)

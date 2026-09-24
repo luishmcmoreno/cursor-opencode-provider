@@ -16,9 +16,22 @@ function resolveWorkspaceRoot(
   sessionKey: string | undefined,
   optionsWorkspaceRoot: string | undefined,
   cwd: string,
+  headers?: Record<string, string | undefined>,
 ): string {
+  const headerDir = (() => {
+    const h = headers ?? {}
+    const raw = h["x-opencode-directory"] ?? h["X-Opencode-Directory"] ?? h["x-opencode-dir"]
+    if (typeof raw === "string" && raw.trim().length > 0) {
+      try {
+        return decodeURIComponent(raw.trim())
+      } catch {
+        return raw.trim()
+      }
+    }
+    return undefined
+  })()
   return path.resolve(
-    getSessionDirectory(sessionKey) ?? (optionsWorkspaceRoot || cwd),
+    headerDir ?? getSessionDirectory(sessionKey) ?? (optionsWorkspaceRoot || cwd),
   )
 }
 
@@ -57,5 +70,14 @@ describe("v1 / OpenCode 2.0 workspace root compatibility", () => {
     expect(resolveWorkspaceRoot("ses_new", undefined, "/tmp/daemon")).toBe(
       path.resolve("/tmp/daemon"),
     )
+  })
+
+  it("OpenCode 2.0: x-opencode-directory header wins over session marks and fallback", () => {
+    markSessionDirectory("ses_header", "/session/mark/dir")
+    expect(
+      resolveWorkspaceRoot("ses_header", "/workspace", "/workspace", {
+        "x-opencode-directory": encodeURIComponent("/custom/header/project"),
+      }),
+    ).toBe(path.resolve("/custom/header/project"))
   })
 })
